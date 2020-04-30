@@ -32,19 +32,17 @@ use libra_crypto::HashValue;
 use libra_types::{
     account_address::AccountAddress,
     account_state_blob::AccountStateBlob,
+    epoch_info::EpochInfo,
     ledger_info::LedgerInfoWithSignatures,
-    on_chain_config::ValidatorSet,
-    proof::{definition::LeafCount, SparseMerkleProof, SparseMerkleRangeProof},
+    proof::{SparseMerkleProof, SparseMerkleRangeProof},
     transaction::{
         Transaction, TransactionInfo, TransactionListWithProof, TransactionToCommit, Version,
     },
 };
 #[cfg(any(test, feature = "fuzzing"))]
-use proptest::prelude::*;
-#[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use serde::{Deserialize, Serialize};
 use std::convert::{TryFrom, TryInto};
+use storage_interface::{StartupInfo, TreeState};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
@@ -491,28 +489,6 @@ impl From<GetTransactionsResponse> for crate::proto::storage::GetTransactionsRes
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
-pub struct TreeState {
-    pub num_transactions: LeafCount,
-    pub ledger_frozen_subtree_hashes: Vec<HashValue>,
-    pub account_state_root_hash: HashValue,
-}
-
-impl TreeState {
-    pub fn new(
-        num_transactions: LeafCount,
-        ledger_frozen_subtree_hashes: Vec<HashValue>,
-        account_state_root_hash: HashValue,
-    ) -> Self {
-        Self {
-            num_transactions,
-            ledger_frozen_subtree_hashes,
-            account_state_root_hash,
-        }
-    }
-}
-
 impl TryFrom<crate::proto::storage::TreeState> for TreeState {
     type Error = Error;
 
@@ -552,92 +528,6 @@ impl From<TreeState> for crate::proto::storage::TreeState {
     }
 }
 
-/// Helper to construct and parse [`proto::storage::StartupInfo`]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StartupInfo {
-    /// The latest ledger info.
-    pub latest_ledger_info: LedgerInfoWithSignatures,
-    /// If the above ledger info doesn't carry a validator set, the latest validator set. Otherwise
-    /// `None`.
-    pub latest_validator_set: Option<ValidatorSet>,
-    pub committed_tree_state: TreeState,
-    pub synced_tree_state: Option<TreeState>,
-}
-
-impl StartupInfo {
-    pub fn new(
-        latest_ledger_info: LedgerInfoWithSignatures,
-        latest_validator_set: Option<ValidatorSet>,
-        committed_tree_state: TreeState,
-        synced_tree_state: Option<TreeState>,
-    ) -> Self {
-        Self {
-            latest_ledger_info,
-            latest_validator_set,
-            committed_tree_state,
-            synced_tree_state,
-        }
-    }
-
-    pub fn get_validator_set(&self) -> &ValidatorSet {
-        match self.latest_ledger_info.ledger_info().next_validator_set() {
-            Some(x) => x,
-            None => self
-                .latest_validator_set
-                .as_ref()
-                .expect("Validator set must exist."),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "fuzzing"))]
-fn arb_startup_info() -> impl Strategy<Value = StartupInfo> {
-    any::<LedgerInfoWithSignatures>()
-        .prop_flat_map(|latest_ledger_info| {
-            let latest_validator_set_strategy = if latest_ledger_info
-                .ledger_info()
-                .next_validator_set()
-                .is_some()
-            {
-                Just(None).boxed()
-            } else {
-                any::<ValidatorSet>().prop_map(Some).boxed()
-            };
-
-            (
-                Just(latest_ledger_info),
-                latest_validator_set_strategy,
-                any::<TreeState>(),
-                any::<Option<TreeState>>(),
-            )
-        })
-        .prop_map(
-            |(
-                latest_ledger_info,
-                latest_validator_set,
-                committed_tree_state,
-                synced_tree_state,
-            )| {
-                StartupInfo::new(
-                    latest_ledger_info,
-                    latest_validator_set,
-                    committed_tree_state,
-                    synced_tree_state,
-                )
-            },
-        )
-}
-
-#[cfg(any(test, feature = "fuzzing"))]
-impl Arbitrary for StartupInfo {
-    type Parameters = ();
-    type Strategy = BoxedStrategy<Self>;
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        arb_startup_info().boxed()
-    }
-}
-
 impl TryFrom<crate::proto::storage::StartupInfo> for StartupInfo {
     type Error = Error;
 
@@ -646,10 +536,7 @@ impl TryFrom<crate::proto::storage::StartupInfo> for StartupInfo {
             .latest_ledger_info
             .ok_or_else(|| format_err!("Missing latest_ledger_info"))?
             .try_into()?;
-        let latest_validator_set = proto
-            .latest_validator_set
-            .map(TryInto::try_into)
-            .transpose()?;
+        let latest_epoch_info: Option<EpochInfo> = lcs::from_bytes(&proto.latest_epoch_info)?;
         let committed_tree_state = proto
             .committed_tree_state
             .ok_or_else(|| format_err!("Missing committed_tree_state"))?
@@ -657,17 +544,14 @@ impl TryFrom<crate::proto::storage::StartupInfo> for StartupInfo {
         let synced_tree_state = proto.synced_tree_state.map(TryInto::try_into).transpose()?;
 
         ensure!(
-            latest_ledger_info
-                .ledger_info()
-                .next_validator_set()
-                .is_some()
-                != latest_validator_set.is_some(),
+            latest_ledger_info.ledger_info().next_epoch_info().is_some()
+                != latest_epoch_info.is_some(),
             "Only one validator set should exist.",
         );
 
         Ok(Self {
             latest_ledger_info,
-            latest_validator_set,
+            latest_epoch_info,
             committed_tree_state,
             synced_tree_state,
         })
@@ -677,13 +561,14 @@ impl TryFrom<crate::proto::storage::StartupInfo> for StartupInfo {
 impl From<StartupInfo> for crate::proto::storage::StartupInfo {
     fn from(info: StartupInfo) -> Self {
         let latest_ledger_info = Some(info.latest_ledger_info.into());
-        let latest_validator_set = info.latest_validator_set.map(Into::into);
+        let latest_epoch_info =
+            lcs::to_bytes(&info.latest_epoch_info).expect("failed to serialize EpochInfo");
         let committed_tree_state = Some(info.committed_tree_state.into());
         let synced_tree_state = info.synced_tree_state.map(Into::into);
 
         Self {
             latest_ledger_info,
-            latest_validator_set,
+            latest_epoch_info,
             committed_tree_state,
             synced_tree_state,
         }
@@ -692,7 +577,6 @@ impl From<StartupInfo> for crate::proto::storage::StartupInfo {
 
 /// Helper to construct and parse [`proto::storage::GetStartupInfoResponse`]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct GetStartupInfoResponse {
     pub info: Option<StartupInfo>,
 }

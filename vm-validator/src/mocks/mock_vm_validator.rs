@@ -10,32 +10,32 @@ use libra_types::{
     transaction::{SignedTransaction, VMValidatorResult},
     vm_error::{StatusCode, VMStatus},
 };
-use libra_vm::VMVerifier;
+use libra_vm::VMValidator;
 use std::convert::TryFrom;
 
 #[derive(Clone)]
 pub struct MockVMValidator;
 
-impl VMVerifier for MockVMValidator {
+impl VMValidator for MockVMValidator {
     fn validate_transaction(
         &self,
         _transaction: SignedTransaction,
         _state_view: &dyn StateView,
     ) -> VMValidatorResult {
-        VMValidatorResult::new(None, 0)
+        VMValidatorResult::new(None, 0, false)
     }
 }
 
-#[async_trait::async_trait]
 impl TransactionValidation for MockVMValidator {
     type ValidationInstance = MockVMValidator;
-    async fn validate_transaction(&self, txn: SignedTransaction) -> Result<VMValidatorResult> {
+    fn validate_transaction(&self, txn: SignedTransaction) -> Result<VMValidatorResult> {
         let txn = match txn.check_signature() {
             Ok(txn) => txn,
             Err(_) => {
                 return Ok(VMValidatorResult::new(
                     Some(VMStatus::new(StatusCode::INVALID_SIGNATURE)),
                     0,
+                    false,
                 ))
             }
         };
@@ -74,7 +74,7 @@ impl TransactionValidation for MockVMValidator {
         } else {
             None
         };
-        Ok(VMValidatorResult::new(ret, 0))
+        Ok(VMValidatorResult::new(ret, 0, false))
     }
 
     fn restart(&mut self, _config: OnChainConfigPayload) -> Result<()> {

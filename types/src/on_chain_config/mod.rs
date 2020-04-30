@@ -14,12 +14,15 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
 mod libra_version;
+mod registered_currencies;
 mod validator_set;
-mod vm_publishing_option;
+mod vm_config;
 
 pub use self::{
-    libra_version::LibraVersion, validator_set::ValidatorSet,
-    vm_publishing_option::VMPublishingOption,
+    libra_version::LibraVersion,
+    registered_currencies::RegisteredCurrencies,
+    validator_set::ValidatorSet,
+    vm_config::{VMConfig, VMPublishingOption},
 };
 use crate::move_resource::MoveResource;
 
@@ -41,9 +44,10 @@ impl ConfigID {
 
 /// State sync will panic if the value of any config in this registry is uninitialized
 pub const ON_CHAIN_CONFIG_REGISTRY: &[ConfigID] = &[
-    VMPublishingOption::CONFIG_ID,
+    VMConfig::CONFIG_ID,
     LibraVersion::CONFIG_ID,
     ValidatorSet::CONFIG_ID,
+    RegisteredCurrencies::CONFIG_ID,
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,7 +84,7 @@ pub trait ConfigStorage {
 }
 
 /// Trait to be implemented by a Rust struct representation of an on-chain config
-/// that is stored in storage as a deserialized byte array
+/// that is stored in storage as a serialized byte array
 pub trait OnChainConfig: Send + Sync + DeserializeOwned {
     // association_address
     const ADDRESS: &'static str = "0xA550C18";
@@ -118,7 +122,7 @@ pub trait OnChainConfig: Send + Sync + DeserializeOwned {
 }
 
 pub fn new_epoch_event_key() -> EventKey {
-    EventKey::new_from_address(&association_address(), 4)
+    EventKey::new_from_address(&association_address(), 16)
 }
 
 pub fn access_path_for_config(address: AccountAddress, config_name: Identifier) -> AccessPath {
@@ -141,7 +145,7 @@ pub fn access_path_for_config(address: AccountAddress, config_name: Identifier) 
     )
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigurationResource {
     epoch: u64,
     last_reconfiguration_time: u64,
@@ -152,8 +156,38 @@ impl ConfigurationResource {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
+
     pub fn last_reconfiguration_time(&self) -> u64 {
         self.last_reconfiguration_time
+    }
+
+    pub fn events(&self) -> &EventHandle {
+        &self.events
+    }
+
+    #[cfg(feature = "fuzzing")]
+    pub fn bump_epoch_for_test(&self) -> Self {
+        let epoch = self.epoch + 1;
+        let last_reconfiguration_time = self.last_reconfiguration_time + 1;
+        let mut events = self.events.clone();
+        *events.count_mut() += 1;
+
+        Self {
+            epoch,
+            last_reconfiguration_time,
+            events,
+        }
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+impl Default for ConfigurationResource {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            last_reconfiguration_time: 0,
+            events: EventHandle::new_from_address(&association_address(), 16),
+        }
     }
 }
 

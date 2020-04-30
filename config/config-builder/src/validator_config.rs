@@ -2,32 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{BuildSwarm, Error};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, format_err, Result};
 use executor::db_bootstrapper;
 use libra_config::{
     config::{
-        ConsensusType, NodeConfig, RemoteService, SafetyRulesBackend, SafetyRulesService,
+        ConsensusType, NodeConfig, RemoteService, SafetyRulesService, SecureBackend,
         SeedPeersConfig, VaultConfig,
     },
-    generator::{self, ValidatorSwarm},
+    generator,
 };
 use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
-use libra_types::{discovery_set::DiscoverySet, on_chain_config::ValidatorSet};
+use libra_network_address::NetworkAddress;
+use libra_temppath::TempPath;
+use libra_types::waypoint::Waypoint;
 use libra_vm::LibraVM;
-use parity_multiaddr::Multiaddr;
+use libradb::LibraDB;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr};
+use storage_interface::DbReaderWriter;
 
 const DEFAULT_SEED: [u8; 32] = [13u8; 32];
 const DEFAULT_ADVERTISED: &str = "/ip4/127.0.0.1/tcp/6180";
 const DEFAULT_LISTEN: &str = "/ip4/0.0.0.0/tcp/6180";
 
 pub struct ValidatorConfig {
-    advertised: Multiaddr,
+    advertised: NetworkAddress,
     build_waypoint: bool,
-    bootstrap: Multiaddr,
+    bootstrap: NetworkAddress,
     index: usize,
-    listen: Multiaddr,
+    listen: NetworkAddress,
     nodes: usize,
     nodes_in_genesis: Option<usize>,
     safety_rules_addr: Option<SocketAddr>,
@@ -42,11 +45,11 @@ pub struct ValidatorConfig {
 impl Default for ValidatorConfig {
     fn default() -> Self {
         Self {
-            advertised: DEFAULT_ADVERTISED.parse::<Multiaddr>().unwrap(),
-            bootstrap: DEFAULT_ADVERTISED.parse::<Multiaddr>().unwrap(),
+            advertised: NetworkAddress::from_str(DEFAULT_ADVERTISED).unwrap(),
+            bootstrap: NetworkAddress::from_str(DEFAULT_ADVERTISED).unwrap(),
             build_waypoint: true,
             index: 0,
-            listen: DEFAULT_LISTEN.parse::<Multiaddr>().unwrap(),
+            listen: NetworkAddress::from_str(DEFAULT_LISTEN).unwrap(),
             nodes: 1,
             nodes_in_genesis: None,
             safety_rules_addr: None,
@@ -65,12 +68,12 @@ impl ValidatorConfig {
         Self::default()
     }
 
-    pub fn advertised(&mut self, advertised: Multiaddr) -> &mut Self {
+    pub fn advertised(&mut self, advertised: NetworkAddress) -> &mut Self {
         self.advertised = advertised;
         self
     }
 
-    pub fn bootstrap(&mut self, bootstrap: Multiaddr) -> &mut Self {
+    pub fn bootstrap(&mut self, bootstrap: NetworkAddress) -> &mut Self {
         self.bootstrap = bootstrap;
         self
     }
@@ -85,7 +88,7 @@ impl ValidatorConfig {
         self
     }
 
-    pub fn listen(&mut self, listen: Multiaddr) -> &mut Self {
+    pub fn listen(&mut self, listen: NetworkAddress) -> &mut Self {
         self.listen = listen;
         self
     }
@@ -166,9 +169,15 @@ impl ValidatorConfig {
         Ok(configs)
     }
 
-    pub fn build_faucet_client(&self) -> Ed25519PrivateKey {
-        let (faucet_key, _) = self.build_faucet();
-        faucet_key
+    pub fn build_faucet_client(&self) -> Result<(Ed25519PrivateKey, Waypoint)> {
+        let (configs, faucet_key) = self.build_common(false, false)?;
+        Ok((
+            faucet_key,
+            configs[0]
+                .base
+                .waypoint
+                .ok_or_else(|| format_err!("Waypoint not generated"))?,
+        ))
     }
 
     pub fn build_common(
@@ -185,12 +194,8 @@ impl ValidatorConfig {
             }
         );
 
-        let (faucet_key, config_seed) = self.build_faucet();
-        let ValidatorSwarm {
-            mut nodes,
-            validator_set,
-            discovery_set,
-        } = generator::validator_swarm(
+        let (faucet_key, config_seed) = self.build_faucet_key();
+        let generator::ValidatorSwarm { mut nodes, .. } = generator::validator_swarm(
             &self.template,
             self.nodes,
             config_seed,
@@ -206,23 +211,12 @@ impl ValidatorConfig {
         // Optionally choose a limited subset of generated validators to be
         // present at genesis time.
         let nodes_in_genesis = self.nodes_in_genesis.unwrap_or(self.nodes);
-        let validator_set = ValidatorSet::new(
-            validator_set
-                .payload()
-                .iter()
-                .take(nodes_in_genesis)
-                .cloned()
-                .collect(),
-        );
-        let discovery_set =
-            DiscoverySet::new(discovery_set.into_iter().take(nodes_in_genesis).collect());
+
+        let validators = vm_genesis::validator_registrations(&nodes[..nodes_in_genesis]);
 
         let genesis = vm_genesis::encode_genesis_transaction_with_validator(
-            &faucet_key,
             faucet_key.public_key(),
-            &nodes,
-            validator_set,
-            discovery_set,
+            &validators,
             self.template
                 .test
                 .as_ref()
@@ -230,12 +224,16 @@ impl ValidatorConfig {
         );
 
         let waypoint = if self.build_waypoint {
-            Some(db_bootstrapper::compute_genesis_waypoint::<LibraVM>(
-                genesis.clone(),
-            )?)
+            let path = TempPath::new();
+            let db_rw = DbReaderWriter::new(LibraDB::new(&path));
+            Some(
+                db_bootstrapper::bootstrap_db_if_empty::<LibraVM>(&db_rw, &genesis)?
+                    .ok_or_else(|| format_err!("Failed to bootstrap empty DB."))?,
+            )
         } else {
             None
         };
+
         let genesis = Some(genesis);
 
         for node in &mut nodes {
@@ -246,7 +244,7 @@ impl ValidatorConfig {
         Ok((nodes, faucet_key))
     }
 
-    fn build_faucet(&self) -> (Ed25519PrivateKey, [u8; 32]) {
+    pub fn build_faucet_key(&self) -> (Ed25519PrivateKey, [u8; 32]) {
         let mut faucet_rng = StdRng::from_seed(self.seed);
         let faucet_key = Ed25519PrivateKey::generate(&mut faucet_rng);
         let config_seed: [u8; 32] = faucet_rng.gen();
@@ -264,9 +262,9 @@ impl ValidatorConfig {
 
         if let Some(backend) = &self.safety_rules_backend {
             safety_rules_config.backend = match backend.as_str() {
-                "in-memory" => SafetyRulesBackend::InMemoryStorage,
+                "in-memory" => SecureBackend::InMemoryStorage,
                 "on-disk" => safety_rules_config.backend.clone(),
-                "vault" => SafetyRulesBackend::Vault(VaultConfig {
+                "vault" => SecureBackend::Vault(VaultConfig {
                     default: true,
                     namespace: self.safety_rules_namespace.clone(),
                     server: self
@@ -315,12 +313,25 @@ mod test {
         assert_eq!(network.advertised_address, seed_peer_ips[0]);
         assert_eq!(
             network.advertised_address,
-            DEFAULT_ADVERTISED.parse::<Multiaddr>().unwrap()
+            NetworkAddress::from_str(DEFAULT_ADVERTISED).unwrap()
         );
         assert_eq!(
             network.listen_address,
-            DEFAULT_LISTEN.parse::<Multiaddr>().unwrap()
+            NetworkAddress::from_str(DEFAULT_LISTEN).unwrap()
         );
         assert!(config.execution.genesis.is_some());
+    }
+
+    #[test]
+    fn verify_same_genesis() {
+        let config1 = ValidatorConfig::new().nodes(10).index(1).build().unwrap();
+        let config2 = ValidatorConfig::new()
+            .nodes(13)
+            .index(12)
+            .nodes_in_genesis(Some(10))
+            .build()
+            .unwrap();
+
+        assert_eq!(config1.execution.genesis, config2.execution.genesis);
     }
 }

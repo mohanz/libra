@@ -8,6 +8,7 @@ use libra_types::{
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     block_info::BlockInfo,
     contract_event::ContractEvent,
+    epoch_change::EpochChangeProof,
     event::EventKey,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     proof::{
@@ -17,12 +18,10 @@ use libra_types::{
     transaction::{
         Transaction, TransactionInfo, TransactionListWithProof, TransactionWithProof, Version,
     },
-    validator_change::ValidatorChangeProof,
     vm_error::StatusCode,
 };
 use std::collections::BTreeMap;
-use storage_interface::DbReader;
-use storage_proto::StartupInfo;
+use storage_interface::{DbReader, StartupInfo, TreeState};
 
 /// Lightweight mock of LibraDB
 #[derive(Clone)]
@@ -185,7 +184,7 @@ impl DbReader for MockLibraDB {
         known_version: u64,
     ) -> Result<(
         LedgerInfoWithSignatures,
-        ValidatorChangeProof,
+        EpochChangeProof,
         AccumulatorConsistencyProof,
     )> {
         let li = self.get_latest_ledger_info()?;
@@ -201,9 +200,9 @@ impl DbReader for MockLibraDB {
         &self,
         _known_version: u64,
         _ledger_info: LedgerInfoWithSignatures,
-    ) -> Result<(ValidatorChangeProof, AccumulatorConsistencyProof)> {
+    ) -> Result<(EpochChangeProof, AccumulatorConsistencyProof)> {
         Ok((
-            ValidatorChangeProof::new(vec![], false),
+            EpochChangeProof::new(vec![], false),
             AccumulatorConsistencyProof::new(vec![]),
         ))
     }
@@ -233,6 +232,22 @@ impl DbReader for MockLibraDB {
     }
 
     fn get_latest_state_root(&self) -> Result<(u64, HashValue)> {
+        unimplemented!()
+    }
+
+    fn get_latest_tree_state(&self) -> Result<TreeState> {
+        unimplemented!()
+    }
+
+    fn get_epoch_change_ledger_infos(
+        &self,
+        _start_epoch: u64,
+        _end_epoch: u64,
+    ) -> Result<EpochChangeProof> {
+        unimplemented!()
+    }
+
+    fn get_ledger_info(&self, _: u64) -> Result<LedgerInfoWithSignatures> {
         unimplemented!()
     }
 }

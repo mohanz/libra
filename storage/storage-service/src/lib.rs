@@ -17,11 +17,11 @@ use futures::{channel::mpsc, sink::SinkExt};
 use libra_config::config::NodeConfig;
 use libra_logger::prelude::*;
 use libra_types::proto::types::{
-    UpdateToLatestLedgerRequest, UpdateToLatestLedgerResponse, ValidatorChangeProof,
+    EpochChangeProof, UpdateToLatestLedgerRequest, UpdateToLatestLedgerResponse,
 };
 use libradb::LibraDB;
 use std::{convert::TryFrom, path::Path, sync::Arc};
-use storage_interface::{DbReader, DbReaderWriter, DbWriter, Error};
+use storage_interface::{DbReader, DbReaderWriter, DbWriter, Error, StartupInfo};
 use storage_proto::proto::storage::{
     storage_server::{Storage, StorageServer},
     BackupAccountStateRequest, BackupAccountStateResponse, BackupTransactionInfoRequest,
@@ -38,7 +38,6 @@ use tokio::runtime::Runtime;
 use libra_secure_net::NetworkServer;
 use libra_types::{account_state_blob::AccountStateBlob, proof::SparseMerkleProof};
 use std::thread::{self, JoinHandle};
-use storage_proto::StartupInfo;
 
 /// Starts storage service with a given LibraDB
 pub fn start_simple_storage_service_with_db(
@@ -108,7 +107,7 @@ impl SimpleStorageService {
     }
 
     fn run(self, config: &NodeConfig) -> JoinHandle<()> {
-        let mut network_server = NetworkServer::new(config.storage.address);
+        let mut network_server = NetworkServer::new(config.storage.simple_address);
         thread::spawn(move || loop {
             if let Err(e) = self.process_one_message(&mut network_server) {
                 warn!("Failed to process message: {}", e);
@@ -194,19 +193,14 @@ impl StorageService {
     ) -> Result<UpdateToLatestLedgerResponse> {
         let rust_req = libra_types::get_with_proof::UpdateToLatestLedgerRequest::try_from(req)?;
 
-        let (
-            response_items,
-            ledger_info_with_sigs,
-            validator_change_proof,
-            ledger_consistency_proof,
-        ) = self
-            .db
-            .update_to_latest_ledger(rust_req.client_known_version, rust_req.requested_items)?;
+        let (response_items, ledger_info_with_sigs, epoch_change_proof, ledger_consistency_proof) =
+            self.db
+                .update_to_latest_ledger(rust_req.client_known_version, rust_req.requested_items)?;
 
         let rust_resp = libra_types::get_with_proof::UpdateToLatestLedgerResponse {
             response_items,
             ledger_info_with_sigs,
-            validator_change_proof,
+            epoch_change_proof,
             ledger_consistency_proof,
         };
 
@@ -290,13 +284,12 @@ impl StorageService {
     fn get_epoch_change_ledger_infos_inner(
         &self,
         req: GetEpochChangeLedgerInfosRequest,
-    ) -> Result<ValidatorChangeProof> {
+    ) -> Result<EpochChangeProof> {
         let rust_req = storage_proto::GetEpochChangeLedgerInfosRequest::try_from(req)?;
         let (ledger_infos, more) = self
             .db
             .get_epoch_change_ledger_infos(rust_req.start_epoch, rust_req.end_epoch)?;
-        let rust_resp =
-            libra_types::validator_change::ValidatorChangeProof::new(ledger_infos, more);
+        let rust_resp = libra_types::epoch_change::EpochChangeProof::new(ledger_infos, more);
         Ok(rust_resp.into())
     }
 
@@ -402,7 +395,7 @@ impl Storage for StorageService {
     async fn get_epoch_change_ledger_infos(
         &self,
         request: tonic::Request<GetEpochChangeLedgerInfosRequest>,
-    ) -> Result<tonic::Response<ValidatorChangeProof>, tonic::Status> {
+    ) -> Result<tonic::Response<EpochChangeProof>, tonic::Status> {
         trace!("[GRPC] Storage::get_epoch_change_ledger_infos");
         let req = request.into_inner();
         let resp = self

@@ -71,6 +71,7 @@ pub enum ModuleOrAddress {
 pub struct Main {
     pub uses: Vec<(ModuleIdent, Option<ModuleName>)>,
     pub function: Function,
+    pub specs: Vec<SpecBlock>,
 }
 
 //**************************************************************************************************
@@ -174,26 +175,49 @@ pub struct SpecBlock_ {
     pub members: Vec<SpecBlockMember>,
 }
 
+pub type SpecBlock = Spanned<SpecBlock_>;
+
 #[derive(Debug, PartialEq)]
 pub enum SpecBlockTarget_ {
     Code,
     Module,
     Function(FunctionName),
     Structure(StructName),
+    Schema(Name, Vec<(Name, Kind)>),
 }
 
 pub type SpecBlockTarget = Spanned<SpecBlockTarget_>;
 
-pub type SpecBlock = Spanned<SpecBlock_>;
+#[derive(Debug, PartialEq)]
+pub struct PragmaProperty_ {
+    pub name: Name,
+    pub value: Option<Value>,
+}
+
+pub type PragmaProperty = Spanned<PragmaProperty_>;
 
 #[derive(Debug, PartialEq)]
+pub struct SpecApplyPattern_ {
+    pub visibility: Option<FunctionVisibility>,
+    pub name_pattern: Vec<SpecApplyFragment>,
+    pub type_parameters: Vec<(Name, Kind)>,
+}
+
+pub type SpecApplyPattern = Spanned<SpecApplyPattern_>;
+
+#[derive(Debug, PartialEq)]
+pub enum SpecApplyFragment_ {
+    Wildcard,
+    NamePart(Name),
+}
+
+pub type SpecApplyFragment = Spanned<SpecApplyFragment_>;
+
+#[derive(Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SpecBlockMember_ {
     Condition {
         kind: SpecConditionKind,
-        exp: Exp,
-    },
-    Invariant {
-        kind: InvariantKind,
         exp: Exp,
     },
     Function {
@@ -202,8 +226,25 @@ pub enum SpecBlockMember_ {
         body: FunctionBody,
     },
     Variable {
+        is_global: bool,
         name: Name,
+        type_parameters: Vec<(Name, Kind)>,
         type_: Type,
+    },
+    Include {
+        name: ModuleAccess,
+        type_arguments: Option<Vec<Type>>,
+        arguments: Vec<(Name, Exp)>,
+    },
+    Apply {
+        name: ModuleAccess,
+        type_arguments: Option<Vec<Type>>,
+        patterns: Vec<SpecApplyPattern>,
+        arguments: Vec<(Name, Exp)>,
+        exclusion_patterns: Vec<SpecApplyPattern>,
+    },
+    Pragma {
+        properties: Vec<PragmaProperty>,
     },
 }
 
@@ -218,6 +259,12 @@ pub enum SpecConditionKind {
     AbortsIf,
     Ensures,
     Requires,
+    RequiresModule,
+    Invariant,
+    InvariantUpdate,
+    InvariantPack,
+    InvariantUnpack,
+    InvariantModule,
 }
 
 // Specification invaiant kind.
@@ -227,17 +274,21 @@ pub enum InvariantKind {
     Update,
     Pack,
     Unpack,
+    Module,
 }
 
 //**************************************************************************************************
 // Types
 //**************************************************************************************************
 
-// A ModuleAccess references something from a module, either a struct or a function.
+// A ModuleAccess references a local or global name or something from a module,
+// either a struct type or a function.
 #[derive(Debug, PartialEq)]
 pub enum ModuleAccess_ {
     // N
     Name(Name),
+    // ::N
+    Global(Name),
     // M.S
     ModuleAccess(ModuleName, Name),
     // OxADDR.M.S
@@ -378,10 +429,8 @@ pub enum Exp_ {
     Move(Var),
     // copy(x)
     Copy(Var),
-    // n
-    Name(Name),
-    // ::n(e)
-    GlobalCall(Name, Option<Vec<Type>>, Spanned<Vec<Exp>>),
+    // [m::]n[<t1, .., tn>]
+    Name(ModuleAccess, Option<Vec<Type>>),
 
     // f(earg,*)
     Call(ModuleAccess, Option<Vec<Type>>, Spanned<Vec<Exp>>),
@@ -681,9 +730,17 @@ impl AstDebug for FileDefinition {
 
 impl AstDebug for Main {
     fn ast_debug(&self, w: &mut AstWriter) {
-        let Main { uses, function } = self;
+        let Main {
+            uses,
+            function,
+            specs,
+        } = self;
         uses.ast_debug(w);
         function.ast_debug(w);
+        for spec in specs {
+            spec.ast_debug(w);
+            w.new_line();
+        }
     }
 }
 
@@ -790,6 +847,37 @@ impl AstDebug for SpecBlockTarget_ {
             SpecBlockTarget_::Module => w.write("module "),
             SpecBlockTarget_::Function(n) => w.write(&format!("fun {} ", n.0.value)),
             SpecBlockTarget_::Structure(n) => w.write(&format!("struct {} ", n.0.value)),
+            SpecBlockTarget_::Schema(n, tys) => {
+                w.write(&format!("schema {}", n.value));
+                if !tys.is_empty() {
+                    w.write("<");
+                    w.list(tys, ", ", |w, ty| {
+                        ty.ast_debug(w);
+                        true
+                    });
+                    w.write(">");
+                }
+            }
+        }
+    }
+}
+
+impl AstDebug for SpecConditionKind {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        use SpecConditionKind::*;
+        match self {
+            Assert => w.write("assert "),
+            Assume => w.write("assume "),
+            Decreases => w.write("decreases "),
+            AbortsIf => w.write("aborts_if "),
+            Ensures => w.write("ensures "),
+            Requires => w.write("requires "),
+            RequiresModule => w.write("requires module "),
+            Invariant => w.write("invariant "),
+            InvariantUpdate => w.write("invariant update "),
+            InvariantPack => w.write("invariant pack "),
+            InvariantUnpack => w.write("invariant unpack "),
+            InvariantModule => w.write("invariant module "),
         }
     }
 }
@@ -798,24 +886,7 @@ impl AstDebug for SpecBlockMember_ {
     fn ast_debug(&self, w: &mut AstWriter) {
         match self {
             SpecBlockMember_::Condition { kind, exp } => {
-                match kind {
-                    SpecConditionKind::Assert => w.write("assert "),
-                    SpecConditionKind::Assume => w.write("assume "),
-                    SpecConditionKind::Decreases => w.write("decreases "),
-                    SpecConditionKind::AbortsIf => w.write("aborts_if "),
-                    SpecConditionKind::Ensures => w.write("ensures "),
-                    SpecConditionKind::Requires => w.write("requires "),
-                }
-                exp.ast_debug(w);
-            }
-            SpecBlockMember_::Invariant { kind, exp } => {
-                w.write("invariant ");
-                match kind {
-                    InvariantKind::Data => {}
-                    InvariantKind::Update => w.write("update "),
-                    InvariantKind::Pack => w.write("pack "),
-                    InvariantKind::Unpack => w.write("unpack "),
-                }
+                kind.ast_debug(w);
                 exp.ast_debug(w);
             }
             SpecBlockMember_::Function {
@@ -834,11 +905,122 @@ impl AstDebug for SpecBlockMember_ {
                     FunctionBody_::Native => w.writeln(";"),
                 }
             }
-            SpecBlockMember_::Variable { name, type_ } => {
+            SpecBlockMember_::Variable {
+                is_global,
+                name,
+                type_parameters,
+                type_,
+            } => {
+                if *is_global {
+                    w.write("global ");
+                } else {
+                    w.write("local");
+                }
                 w.write(&format!("{}", name));
+                type_parameters.ast_debug(w);
                 w.write(": ");
                 type_.ast_debug(w);
             }
+            SpecBlockMember_::Include {
+                name,
+                type_arguments,
+                arguments,
+            } => {
+                w.write("include ");
+                name.ast_debug(w);
+                if let Some(ty_args) = type_arguments {
+                    w.write("<");
+                    ty_args.ast_debug(w);
+                    w.write(">");
+                }
+                if !arguments.is_empty() {
+                    w.write("{");
+                    w.list(arguments, ", ", |w, (l, r)| {
+                        w.write(&l.value);
+                        w.write(" : ");
+                        r.ast_debug(w);
+                        true
+                    });
+                    w.write("}");
+                }
+            }
+            SpecBlockMember_::Apply {
+                name,
+                type_arguments,
+                arguments,
+                patterns,
+                exclusion_patterns,
+            } => {
+                w.write("apply ");
+                name.ast_debug(w);
+                if let Some(ty_args) = type_arguments {
+                    w.write("<");
+                    ty_args.ast_debug(w);
+                    w.write(">");
+                }
+                if !arguments.is_empty() {
+                    w.write("{");
+                    w.list(arguments, ", ", |w, (l, r)| {
+                        w.write(&l.value);
+                        w.write(" : ");
+                        r.ast_debug(w);
+                        true
+                    });
+                    w.write("}");
+                }
+                w.write(" to ");
+                w.list(patterns, ", ", |w, p| {
+                    p.ast_debug(w);
+                    true
+                });
+                if !exclusion_patterns.is_empty() {
+                    w.write(" exclude ");
+                    w.list(exclusion_patterns, ", ", |w, p| {
+                        p.ast_debug(w);
+                        true
+                    });
+                }
+            }
+            SpecBlockMember_::Pragma { properties } => {
+                w.write("pragma ");
+                w.list(properties, ", ", |w, p| {
+                    p.ast_debug(w);
+                    true
+                });
+            }
+        }
+    }
+}
+
+impl AstDebug for SpecApplyPattern_ {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        w.list(&self.name_pattern, "", |w, f| {
+            f.ast_debug(w);
+            true
+        });
+        if !self.type_parameters.is_empty() {
+            w.write("<");
+            self.type_parameters.ast_debug(w);
+            w.write(">");
+        }
+    }
+}
+
+impl AstDebug for SpecApplyFragment_ {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        match self {
+            SpecApplyFragment_::Wildcard => w.write("*"),
+            SpecApplyFragment_::NamePart(n) => w.write(&n.value),
+        }
+    }
+}
+
+impl AstDebug for PragmaProperty_ {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        w.write(&self.name.value);
+        if let Some(value) = &self.value {
+            w.write(" = ");
+            value.ast_debug(w);
         }
     }
 }
@@ -979,6 +1161,7 @@ impl AstDebug for ModuleAccess_ {
     fn ast_debug(&self, w: &mut AstWriter) {
         w.write(&match self {
             ModuleAccess_::Name(n) => format!("{}", n),
+            ModuleAccess_::Global(n) => format!("::{}", n),
             ModuleAccess_::ModuleAccess(m, n) => format!("{}::{}", m, n),
             ModuleAccess_::QualifiedModuleAccess(m, n) => format!("{}::{}", m, n),
         })
@@ -1032,17 +1215,13 @@ impl AstDebug for Exp_ {
             E::InferredNum(u) => w.write(&format!("{}", u)),
             E::Move(v) => w.write(&format!("move {}", v)),
             E::Copy(v) => w.write(&format!("copy {}", v)),
-            E::Name(n) => w.write(&format!("{}", n)),
-            E::GlobalCall(n, tys_opt, sp!(_, rhs)) => {
-                w.write(&format!("::{}", n));
+            E::Name(ma, tys_opt) => {
+                ma.ast_debug(w);
                 if let Some(ss) = tys_opt {
                     w.write("<");
                     ss.ast_debug(w);
                     w.write(">");
                 }
-                w.write("(");
-                w.comma(rhs, |w, e| e.ast_debug(w));
-                w.write(")");
             }
             E::Call(ma, tys_opt, sp!(_, rhs)) => {
                 ma.ast_debug(w);

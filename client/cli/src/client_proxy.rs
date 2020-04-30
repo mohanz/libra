@@ -10,11 +10,12 @@ use anyhow::{bail, ensure, format_err, Error, Result};
 use libra_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
     test_utils::KeyPair,
-    traits::ValidKey,
-    x25519, ValidKeyStringExt,
+    traits::ValidCryptoMaterial,
+    x25519, ValidCryptoMaterialStringExt,
 };
-use libra_json_rpc::views::{AccountView, BlockMetadata, EventView, TransactionView};
+use libra_json_rpc_client::views::{AccountView, BlockMetadata, EventView, TransactionView};
 use libra_logger::prelude::*;
+use libra_network_address::{NetworkAddress, RawNetworkAddress};
 use libra_temppath::TempPath;
 use libra_types::{
     access_path::AccessPath,
@@ -37,7 +38,6 @@ use num_traits::{
     cast::{FromPrimitive, ToPrimitive},
     identities::Zero,
 };
-use parity_multiaddr::Multiaddr;
 use reqwest::Url;
 use rust_decimal::Decimal;
 use std::{
@@ -55,7 +55,7 @@ use transaction_builder::encode_register_validator_script;
 
 const CLIENT_WALLET_MNEMONIC_FILE: &str = "client.mnemonic";
 const GAS_UNIT_PRICE: u64 = 0;
-const MAX_GAS_AMOUNT: u64 = 400_000;
+const MAX_GAS_AMOUNT: u64 = 1_000_000;
 const TX_EXPIRATION: i64 = 100;
 
 /// Enum used for error formatting.
@@ -120,7 +120,7 @@ impl ClientProxy {
         sync_on_wallet_recovery: bool,
         faucet_server: Option<String>,
         mnemonic_file: Option<String>,
-        waypoint: Option<Waypoint>,
+        waypoint: Waypoint,
     ) -> Result<Self> {
         // fail fast if url is not valid
         let url = Url::parse(url)?;
@@ -132,15 +132,12 @@ impl ClientProxy {
         let faucet_account = if faucet_account_file.is_empty() {
             None
         } else {
-            let faucet_account_keypair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> =
-                ClientProxy::load_faucet_account_file(faucet_account_file);
+            let faucet_account_key = generate_key::load_key(faucet_account_file);
             let faucet_account_data = Self::get_account_data_from_address(
                 &mut client,
                 association_address(),
                 true,
-                Some(KeyPair::<Ed25519PrivateKey, _>::from(
-                    faucet_account_keypair.private_key,
-                )),
+                Some(KeyPair::from(faucet_account_key)),
                 None,
             )?;
             // Load the keypair from file
@@ -257,8 +254,8 @@ impl ClientProxy {
         );
         let (address, _) = self.get_account_address_from_parameter(space_delim_strings[1])?;
         self.get_account_resource_and_update(address).map(|res| {
-            let whole_num = res.balance / 1_000_000;
-            let remainder = res.balance % 1_000_000;
+            let whole_num = res.balance.amount / 1_000_000;
+            let remainder = res.balance.amount % 1_000_000;
             format!("{}.{:0>6}", whole_num.to_string(), remainder.to_string())
         })
     }
@@ -318,6 +315,7 @@ impl ClientProxy {
         match self.faucet_account {
             Some(_) => self.association_transaction_with_local_faucet_account(
                 transaction_builder::encode_mint_script(
+                    lbr_type_tag(),
                     &receiver,
                     receiver_auth_key.prefix().to_vec(),
                     num_coins,
@@ -399,7 +397,7 @@ impl ClientProxy {
             self.get_account_address_from_parameter(space_delim_strings[1])?;
         match self.faucet_account {
             Some(_) => self.association_transaction_with_local_faucet_account(
-                transaction_builder::encode_remove_validator_script(&account_address),
+                transaction_builder::encode_remove_validator_script(account_address),
                 is_blocking,
             ),
             None => unimplemented!(),
@@ -421,7 +419,7 @@ impl ClientProxy {
             self.get_account_address_from_parameter(space_delim_strings[1])?;
         match self.faucet_account {
             Some(_) => self.association_transaction_with_local_faucet_account(
-                transaction_builder::encode_add_validator_script(&account_address),
+                transaction_builder::encode_add_validator_script(account_address),
                 is_blocking,
             ),
             None => unimplemented!(),
@@ -448,9 +446,11 @@ impl ClientProxy {
         let consensus_public_key = Ed25519PublicKey::from_encoded_string(space_delim_strings[3])?;
         let network_signing_key = Ed25519PublicKey::from_encoded_string(space_delim_strings[4])?;
         let network_identity_key = x25519::PublicKey::from_encoded_string(space_delim_strings[5])?;
-        let network_address = Multiaddr::from_str(space_delim_strings[6])?;
+        let network_address = NetworkAddress::from_str(space_delim_strings[6])?;
+        let network_address = RawNetworkAddress::try_from(&network_address)?;
         let fullnode_identity_key = x25519::PublicKey::from_encoded_string(space_delim_strings[7])?;
-        let fullnode_network_address = Multiaddr::from_str(space_delim_strings[8])?;
+        let fullnode_network_address = NetworkAddress::from_str(space_delim_strings[8])?;
+        let fullnode_network_address = RawNetworkAddress::try_from(&fullnode_network_address)?;
         let mut sender = Self::get_account_data_from_address(
             &mut self.client,
             address,
@@ -462,9 +462,9 @@ impl ClientProxy {
             consensus_public_key.to_bytes().to_vec(),
             network_signing_key.to_bytes().to_vec(),
             network_identity_key.to_bytes(),
-            network_address.to_vec(),
+            network_address.into(),
             fullnode_identity_key.to_bytes(),
-            fullnode_network_address.to_vec(),
+            fullnode_network_address.into(),
         );
         let txn =
             self.create_txn_to_submit(TransactionPayload::Script(program), &sender, None, None)?;
@@ -1097,22 +1097,6 @@ impl ClientProxy {
         self.wallet = wallet;
     }
 
-    fn load_faucet_account_file(
-        faucet_account_file: &str,
-    ) -> KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
-        match fs::read(faucet_account_file) {
-            Ok(data) => {
-                lcs::from_bytes(&data[..]).expect("Unable to deserialize faucet account file")
-            }
-            Err(e) => {
-                panic!(
-                    "Unable to read faucet account file: {}, {}",
-                    faucet_account_file, e
-                );
-            }
-        }
-    }
-
     fn address_from_strings(data: &str) -> Result<AccountAddress> {
         let account_vec: Vec<u8> = hex::decode(data.parse::<String>()?)?;
         ensure!(
@@ -1312,6 +1296,7 @@ impl fmt::Display for AccountEntry {
 mod tests {
     use crate::client_proxy::{parse_bool, AddressAndIndex, ClientProxy};
     use libra_temppath::TempPath;
+    use libra_types::{ledger_info::LedgerInfo, on_chain_config::ValidatorSet, waypoint::Waypoint};
     use libra_wallet::io_utils;
     use proptest::prelude::*;
 
@@ -1320,6 +1305,9 @@ mod tests {
         accounts.reserve(count);
         let file = TempPath::new();
         let mnemonic_path = file.path().to_str().unwrap().to_string();
+        let waypoint =
+            Waypoint::new_epoch_boundary(&LedgerInfo::mock_genesis(Some(ValidatorSet::empty())))
+                .unwrap();
 
         // Note: `client_proxy` won't actually connect to URL - it will be used only to
         // generate random accounts
@@ -1329,7 +1317,7 @@ mod tests {
             false,
             None,
             Some(mnemonic_path),
-            None,
+            waypoint,
         )
         .unwrap();
         for _ in 0..count {

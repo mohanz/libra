@@ -30,6 +30,17 @@ static LOGGER_CONFIGURED: AtomicBool = AtomicBool::new(false);
 /// Atomic used to detect whether we are running in test mode.
 static TEST_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Default for what functions to verify.
+#[derive(Debug, PartialEq)]
+pub enum VerificationScope {
+    /// Verify only public functions.
+    Public,
+    /// Verify all functions.
+    All,
+    /// Verify no functions
+    None,
+}
+
 /// Represents options provided to the tool.
 #[derive(Debug)]
 pub struct Options {
@@ -44,6 +55,11 @@ pub struct Options {
     pub verbosity_level: LevelFilter,
     /// The paths to the move sources.
     pub move_sources: Vec<String>,
+    /// The paths to any dependencies for the move sources. Those will not be verified but
+    /// can be used by `move_sources`.
+    pub move_deps: Vec<String>,
+    /// Paths to directories where dependencies are looked up automatically.
+    pub search_path: Vec<String>,
     /// Path to the boogie executable.
     pub boogie_exe: String,
     /// Path to the z3 executable.
@@ -67,8 +83,8 @@ pub struct Options {
     /// Whether output for e.g. diagnosis shall be stable/redacted so it can be used in test
     /// output.
     pub stable_test_output: bool,
-    /// Whether to only verify functions which have associated specifications
-    pub only_verify_spec: bool,
+    /// Scope of what functions to verify
+    pub verify_scope: VerificationScope,
 }
 
 impl Default for Options {
@@ -79,6 +95,8 @@ impl Default for Options {
             account_address: "0x234567".to_string(),
             verbosity_level: LevelFilter::Warn,
             move_sources: vec![],
+            move_deps: vec![],
+            search_path: vec![],
             boogie_exe: "".to_string(),
             z3_exe: "".to_string(),
             use_cvc4: false,
@@ -90,7 +108,7 @@ impl Default for Options {
             omit_model_debug: false,
             use_array_theory: false,
             stable_test_output: false,
-            only_verify_spec: false,
+            verify_scope: VerificationScope::Public,
         }
     }
 }
@@ -144,9 +162,13 @@ impl Options {
                     .help("only generate boogie file but do not call boogie"),
             )
             .arg(
-                Arg::with_name("only-verify-spec")
-                    .long("only-verify-spec")
-                    .help("whether to only verify functions which have associated specifications"),
+                Arg::with_name("verify")
+                    .long("verify")
+                    .possible_values(&["public", "all", "none"])
+                    .default_value("public")
+                    .value_name("SCOPE")
+                    .help("default scope of verification \
+                    (can be overridden by `pragma verify=true|false`)"),
             )
             .arg(
                 Arg::with_name("native-stubs")
@@ -215,6 +237,26 @@ impl Options {
                     ),
             )
             .arg(
+                Arg::with_name("search_path")
+                    .long("search_path")
+                    .short("s")
+                    .multiple(true)
+                    .number_of_values(1)
+                    .takes_value(true)
+                    .value_name("PATH")
+                    .help("path to a directory where dependencies are looked up automatically")
+            )
+            .arg(
+                Arg::with_name("dependencies")
+                    .long("dep")
+                    .short("d")
+                    .multiple(true)
+                    .number_of_values(1)
+                    .takes_value(true)
+                    .value_name("MOVE_FILE")
+                    .help("path to a move file dependency, which will not be verified")
+            )
+            .arg(
                 Arg::with_name("sources")
                     .multiple(true)
                     .value_name("MOVE_FILE")
@@ -252,9 +294,16 @@ impl Options {
         self.cvc4_exe = get_with_default("cvc4-exe");
         self.boogie_flags = get_vec("boogie-flags");
         self.move_sources = get_vec("sources");
+        self.move_deps = get_vec("dependencies");
+        self.search_path = get_vec("search_path");
         self.use_array_theory = matches.is_present("use-array-theory");
         self.stable_test_output = matches.is_present("stable-test-output");
-        self.only_verify_spec = matches.is_present("only-verify-spec");
+        self.verify_scope = match get_with_default("verify").as_str() {
+            "public" => VerificationScope::Public,
+            "all" => VerificationScope::All,
+            "none" => VerificationScope::None,
+            _ => unreachable!("should not happen"),
+        };
     }
 
     /// Sets up logging based on provided options. This should be called as early as possible

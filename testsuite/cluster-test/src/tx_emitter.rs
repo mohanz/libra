@@ -28,18 +28,19 @@ use libra_types::{
 };
 use rand::{
     prelude::ThreadRng,
-    rngs::{EntropyRng, StdRng},
+    rngs::{OsRng, StdRng},
     seq::{IteratorRandom, SliceRandom},
     Rng, SeedableRng,
 };
 use tokio::runtime::{Handle, Runtime};
 
 use futures::{executor::block_on, future::FutureExt};
-use libra_json_rpc::JsonRpcAsyncClient;
+use libra_json_rpc_client::JsonRpcAsyncClient;
 use libra_types::transaction::SignedTransaction;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use std::{
     cmp::{max, min},
+    str::FromStr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::{task::JoinHandle, time};
@@ -305,10 +306,10 @@ impl TxEmitter {
     }
 
     fn make_client(&self, instance: &Instance) -> JsonRpcAsyncClient {
-        JsonRpcAsyncClient::new(
+        JsonRpcAsyncClient::new_with_client(
             self.http_client.clone(),
-            instance.ip(),
-            instance.ac_port() as u16,
+            Url::from_str(format!("http://{}:{}", instance.ip(), instance.ac_port()).as_str())
+                .expect("Invalid URL."),
         )
     }
 
@@ -508,7 +509,12 @@ fn gen_mint_request(faucet_account: &mut AccountData, num_coins: u64) -> SignedT
     let receiver = faucet_account.address;
     let auth_key_prefix = faucet_account.auth_key_prefix();
     gen_submit_transaction_request(
-        transaction_builder::encode_mint_script(&receiver, auth_key_prefix, num_coins),
+        transaction_builder::encode_mint_script(
+            lbr_type_tag(),
+            &receiver,
+            auth_key_prefix,
+            num_coins,
+        ),
         faucet_account,
     )
 }
@@ -541,7 +547,7 @@ fn gen_random_account(rng: &mut StdRng) -> AccountData {
 }
 
 fn gen_random_accounts(num_accounts: usize) -> Vec<AccountData> {
-    let seed: [u8; 32] = EntropyRng::new().gen();
+    let seed: [u8; 32] = OsRng.gen();
     let mut rng = StdRng::from_seed(seed);
     (0..num_accounts)
         .map(|_| gen_random_account(&mut rng))

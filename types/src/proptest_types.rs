@@ -4,12 +4,13 @@
 use crate::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config::{AccountResource, BalanceResource},
+    account_config::{AccountResource, BalanceResource, LBR_NAME},
     account_state_blob::AccountStateBlob,
     block_info::{BlockInfo, Round},
     block_metadata::BlockMetadata,
     contract_event::ContractEvent,
-    discovery_info::DiscoveryInfo,
+    epoch_change::EpochChangeProof,
+    epoch_info::EpochInfo,
     event::{EventHandle, EventKey},
     get_with_proof::{ResponseItem, UpdateToLatestLedgerResponse},
     language_storage::{StructTag, TypeTag},
@@ -21,7 +22,6 @@ use crate::{
         Transaction, TransactionArgument, TransactionListWithProof, TransactionPayload,
         TransactionStatus, TransactionToCommit, Version,
     },
-    validator_change::ValidatorChangeProof,
     vm_error::{StatusCode, VMStatus},
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
@@ -30,24 +30,17 @@ use libra_crypto::{
     hash::CryptoHash,
     test_utils::KeyPair,
     traits::*,
-    x25519, HashValue,
+    HashValue,
 };
 use libra_proptest_helpers::Index;
 use move_core_types::identifier::Identifier;
-use parity_multiaddr::{Multiaddr, Protocol};
 use proptest::{
     collection::{vec, SizeRange},
     option,
     prelude::*,
 };
 use proptest_derive::Arbitrary;
-use std::{
-    borrow::Cow,
-    convert::TryFrom,
-    iter::{FromIterator, Iterator},
-    net::{Ipv4Addr, Ipv6Addr},
-    time::Duration,
-};
+use std::{convert::TryFrom, iter::Iterator, time::Duration};
 
 impl WriteOp {
     pub fn value_strategy() -> impl Strategy<Value = Self> {
@@ -116,6 +109,7 @@ struct AccountInfo {
     sequence_number: u64,
     sent_event_handle: EventHandle,
     received_event_handle: EventHandle,
+    balance_currency_code: Identifier,
 }
 
 impl AccountInfo {
@@ -128,6 +122,7 @@ impl AccountInfo {
             sequence_number: 0,
             sent_event_handle: EventHandle::new_from_address(&address, 0),
             received_event_handle: EventHandle::new_from_address(&address, 1),
+            balance_currency_code: Identifier::new(LBR_NAME).unwrap(),
         }
     }
 }
@@ -588,13 +583,13 @@ prop_compose! {
     fn arb_update_to_latest_ledger_response()(
         response_items in vec(any::<ResponseItem>(), 0..10),
         ledger_info_with_sigs in any::<LedgerInfoWithSignatures>(),
-        validator_change_proof in any::<ValidatorChangeProof>(),
+        epoch_change_proof in any::<EpochChangeProof>(),
         ledger_consistency_proof in any::<AccumulatorConsistencyProof>(),
     ) -> UpdateToLatestLedgerResponse {
         UpdateToLatestLedgerResponse::new(
             response_items,
             ledger_info_with_sigs,
-            validator_change_proof,
+            epoch_change_proof,
             ledger_consistency_proof,
         )
     }
@@ -657,7 +652,8 @@ impl AccountResourceGen {
             self.delegated_withdrawal_capability,
             account_info.sent_event_handle.clone(),
             account_info.received_event_handle.clone(),
-            0,
+            false,
+            account_info.balance_currency_code.clone(),
         )
     }
 }
@@ -987,10 +983,13 @@ impl BlockInfoGen {
 
         let current_epoch = universe.get_epoch();
         // The first LedgerInfo should always carry a validator set.
-        let (epoch, next_validator_set) = if current_epoch == 0 || self.new_epoch {
+        let (epoch, next_epoch_info) = if current_epoch == 0 || self.new_epoch {
             (
                 universe.get_and_bump_epoch(),
-                Some(ValidatorSet::new(Vec::new())),
+                Some(EpochInfo {
+                    epoch: current_epoch + 1,
+                    verifier: (&ValidatorSet::empty()).into(),
+                }),
             )
         } else {
             (universe.get_epoch(), None)
@@ -1003,7 +1002,7 @@ impl BlockInfoGen {
             self.executed_state_id,
             universe.bump_and_get_version(block_size),
             self.timestamp_usecs,
-            next_validator_set,
+            next_epoch_info,
         )
     }
 }
@@ -1085,54 +1084,5 @@ impl LedgerInfoWithSignaturesGen {
             .collect();
 
         LedgerInfoWithSignatures::new(ledger_info, signatures)
-    }
-}
-
-pub fn arb_multiaddr_protocol() -> impl Strategy<Value = Protocol<'static>> {
-    prop_oneof![
-        any::<u16>().prop_map(Protocol::Tcp),
-        any::<u16>().prop_map(Protocol::Udp),
-        any::<u16>().prop_map(|port| Protocol::Memory(port as u64)),
-        any::<u32>().prop_map(|addr| Protocol::Ip4(Ipv4Addr::from(addr))),
-        any::<u128>().prop_map(|addr| Protocol::Ip6(Ipv6Addr::from(addr))),
-        any::<String>().prop_map(|domain| Protocol::Dns4(Cow::Owned(domain))),
-        any::<String>().prop_map(|domain| Protocol::Dns6(Cow::Owned(domain))),
-    ]
-}
-
-pub fn arb_multiaddr() -> impl Strategy<Value = Multiaddr> {
-    vec(arb_multiaddr_protocol(), 0..10).prop_map(Multiaddr::from_iter)
-}
-
-impl Arbitrary for DiscoveryInfo {
-    type Parameters = ();
-    type Strategy = BoxedStrategy<Self>;
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        (
-            any::<AccountAddress>(),
-            any::<x25519::PublicKey>(),
-            arb_multiaddr(),
-            any::<x25519::PublicKey>(),
-            arb_multiaddr(),
-        )
-            .prop_map(
-                |(
-                    account_address,
-                    validator_network_identity_pubkey,
-                    validator_network_address,
-                    fullnodes_network_identity_pubkey,
-                    fullnodes_network_address,
-                )| {
-                    DiscoveryInfo {
-                        account_address,
-                        validator_network_identity_pubkey,
-                        validator_network_address,
-                        fullnodes_network_identity_pubkey,
-                        fullnodes_network_address,
-                    }
-                },
-            )
-            .boxed()
     }
 }

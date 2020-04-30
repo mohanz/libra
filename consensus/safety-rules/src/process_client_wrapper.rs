@@ -12,11 +12,11 @@ use consensus_types::{
     vote_proposal::VoteProposal,
 };
 use libra_config::{
-    config::{ConsensusType, NodeConfig, RemoteService, SafetyRulesBackend, SafetyRulesService},
+    config::{ConsensusType, NodeConfig, RemoteService, SafetyRulesService, SecureBackend},
     utils,
 };
 use libra_crypto::ed25519::Ed25519Signature;
-use libra_types::{validator_change::ValidatorChangeProof, validator_signer::ValidatorSigner};
+use libra_types::{epoch_change::EpochChangeProof, validator_signer::ValidatorSigner};
 use std::{
     any::TypeId,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -32,7 +32,7 @@ pub struct ProcessClientWrapper<T> {
 }
 
 impl<T: Payload> ProcessClientWrapper<T> {
-    pub fn new(backend: SafetyRulesBackend) -> Self {
+    pub fn new(backend: SecureBackend) -> Self {
         let server_port = utils::get_available_port();
         let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
 
@@ -85,16 +85,12 @@ impl<T: Payload> TSafetyRules<T> for ProcessClientWrapper<T> {
         self.safety_rules.consensus_state()
     }
 
-    fn initialize(&mut self, proof: &ValidatorChangeProof) -> Result<(), Error> {
+    fn initialize(&mut self, proof: &EpochChangeProof) -> Result<(), Error> {
         self.safety_rules.initialize(proof)
     }
 
     fn update(&mut self, qc: &QuorumCert) -> Result<(), Error> {
         self.safety_rules.update(qc)
-    }
-
-    fn start_new_epoch(&mut self, qc: &QuorumCert) -> Result<(), Error> {
-        self.safety_rules.start_new_epoch(qc)
     }
 
     fn construct_and_sign_vote(&mut self, vote_proposal: &VoteProposal<T>) -> Result<Vote, Error> {

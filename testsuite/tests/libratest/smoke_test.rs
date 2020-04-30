@@ -4,12 +4,7 @@
 use cli::client_proxy::ClientProxy;
 use debug_interface::{libra_trace, node_debug_service::parse_events, NodeDebugClient};
 use libra_config::config::{NodeConfig, RoleType, TestConfig};
-use libra_crypto::{
-    ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
-    hash::CryptoHash,
-    test_utils::KeyPair,
-    PrivateKey, SigningKey, Uniform,
-};
+use libra_crypto::{ed25519::Ed25519PrivateKey, hash::CryptoHash, PrivateKey, SigningKey, Uniform};
 use libra_json_rpc::views::{ScriptView, TransactionDataView};
 use libra_logger::prelude::*;
 use libra_swarm::swarm::{LibraNode, LibraSwarm};
@@ -21,8 +16,8 @@ use libra_types::{
 use num_traits::cast::FromPrimitive;
 use rust_decimal::Decimal;
 use std::{
-    fs::{self, File},
-    io::{Read, Result, Write},
+    fs,
+    io::{Result, Write},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -30,7 +25,7 @@ use std::{
 struct TestEnvironment {
     validator_swarm: LibraSwarm,
     full_node_swarm: Option<LibraSwarm>,
-    faucet_key: (KeyPair<Ed25519PrivateKey, Ed25519PublicKey>, String),
+    faucet_key: (Ed25519PrivateKey, String),
     mnemonic_file: TempPath,
 }
 
@@ -55,14 +50,8 @@ impl TestEnvironment {
             .create_as_file()
             .expect("could not create temporary mnemonic_file_path");
 
-        let mut key_file = File::open(&validator_swarm.config.faucet_key_path)
-            .expect("Unable to create faucet key file");
-        let mut serialized_key = Vec::new();
-        key_file
-            .read_to_end(&mut serialized_key)
-            .expect("Unable to read serialized faucet key");
-        let keypair = lcs::from_bytes(&serialized_key).expect("Unable to deserialize faucet key");
-        let keypair_path = validator_swarm
+        let key = generate_key::load_key(&validator_swarm.config.faucet_key_path);
+        let key_path = validator_swarm
             .config
             .faucet_key_path
             .to_str()
@@ -72,7 +61,7 @@ impl TestEnvironment {
         Self {
             validator_swarm,
             full_node_swarm: None,
-            faucet_key: (keypair, keypair_path),
+            faucet_key: (key, key_path),
             mnemonic_file,
         }
     }
@@ -133,7 +122,7 @@ impl TestEnvironment {
             false,
             /* faucet server */ None,
             Some(mnemonic_file_path),
-            waypoint,
+            waypoint.unwrap_or_else(|| self.validator_swarm.config.waypoint),
         )
         .unwrap()
     }
@@ -1045,7 +1034,7 @@ fn test_client_waypoints() {
         .latest_epoch_change_li()
         .expect("Failed to retrieve genesis LedgerInfo");
     assert_eq!(genesis_li.ledger_info().epoch(), 0);
-    let genesis_waypoint = Waypoint::new(genesis_li.ledger_info())
+    let genesis_waypoint = Waypoint::new_epoch_boundary(genesis_li.ledger_info())
         .expect("Failed to generate waypoint from genesis LI");
 
     // Start another client with the genesis waypoint and make sure it successfully connects
@@ -1078,7 +1067,7 @@ fn test_client_waypoints() {
         .expect("Failed to retrieve end of epoch 1 LedgerInfo");
 
     assert_eq!(epoch_1_li.ledger_info().epoch(), 1);
-    let epoch_1_waypoint = Waypoint::new(epoch_1_li.ledger_info())
+    let epoch_1_waypoint = Waypoint::new_epoch_boundary(epoch_1_li.ledger_info())
         .expect("Failed to generate waypoint from end of epoch 1");
 
     // Start a client with the waypoint for end of epoch 1 and make sure it successfully connects
@@ -1091,7 +1080,7 @@ fn test_client_waypoints() {
 
     // Verify that a client with the wrong waypoint is not going to be able to connect to the chain.
     let bad_li = LedgerInfo::mock_genesis(None);
-    let bad_waypoint = Waypoint::new(&bad_li).unwrap();
+    let bad_waypoint = Waypoint::new_epoch_boundary(&bad_li).unwrap();
     let mut client_with_bad_waypoint = env.get_validator_ac_client(1, Some(bad_waypoint));
     assert!(client_with_bad_waypoint.test_trusted_connection().is_err());
 }

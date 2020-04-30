@@ -61,7 +61,7 @@ main() {
   }
 
   BalanceHolder.publish(move(balances));
-  LibraAccount.deposit<LBR.T>({{fees}}, move(lib_coin));
+  LibraAccount.deposit<LBR.T>(0xFEE, move(lib_coin));
   return;
 }
 //! check: EXECUTED
@@ -95,7 +95,7 @@ main() {
      assert(copy(new_balance) == (copy(old_balance) + 10), 77);
   }
 
-  assert(LibraAccount.balance<LBR.T>({{fees}}) == 0, 10000);
+  assert(LibraAccount.balance<LBR.T>(0xFEE) == 0, 10000);
 
   return;
 }

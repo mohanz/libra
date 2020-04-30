@@ -4,6 +4,7 @@
 use crate::{
     account_address::AccountAddress,
     block_info::{BlockInfo, Round},
+    epoch_info::EpochInfo,
     on_chain_config::ValidatorSet,
     transaction::Version,
     validator_verifier::{ValidatorVerifier, VerifyError},
@@ -91,6 +92,10 @@ impl LedgerInfo {
         self.commit_info.epoch()
     }
 
+    pub fn next_block_epoch(&self) -> u64 {
+        self.commit_info.next_block_epoch()
+    }
+
     pub fn round(&self) -> Round {
         self.commit_info.round()
     }
@@ -111,8 +116,8 @@ impl LedgerInfo {
         self.commit_info.timestamp_usecs()
     }
 
-    pub fn next_validator_set(&self) -> Option<&ValidatorSet> {
-        self.commit_info.next_validator_set()
+    pub fn next_epoch_info(&self) -> Option<&EpochInfo> {
+        self.commit_info.next_epoch_info()
     }
 
     /// Returns hash of consensus voting data in this `LedgerInfo`.
@@ -138,10 +143,7 @@ impl TryFrom<crate::proto::types::LedgerInfo> for LedgerInfo {
         let round = proto.round;
         let timestamp_usecs = proto.timestamp_usecs;
 
-        let next_validator_set = proto
-            .next_validator_set
-            .map(ValidatorSet::try_from)
-            .transpose()?;
+        let next_epoch_info = lcs::from_bytes(&proto.next_epoch_info)?;
         Ok(LedgerInfo::new(
             BlockInfo::new(
                 epoch,
@@ -150,7 +152,7 @@ impl TryFrom<crate::proto::types::LedgerInfo> for LedgerInfo {
                 transaction_accumulator_hash,
                 version,
                 timestamp_usecs,
-                next_validator_set,
+                next_epoch_info,
             ),
             consensus_data_hash,
         ))
@@ -167,7 +169,8 @@ impl From<LedgerInfo> for crate::proto::types::LedgerInfo {
             epoch: ledger_info.epoch(),
             round: ledger_info.round(),
             timestamp_usecs: ledger_info.timestamp_usecs(),
-            next_validator_set: ledger_info.next_validator_set().cloned().map(Into::into),
+            next_epoch_info: lcs::to_bytes(&ledger_info.next_epoch_info())
+                .expect("failed to serialize EpochInfo"),
         }
     }
 }

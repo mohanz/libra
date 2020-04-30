@@ -6,21 +6,15 @@
 
 use crate::{
     config::{
-        NodeConfig, OnDiskStorageConfig, SafetyRulesBackend, SafetyRulesService, SeedPeersConfig,
+        NodeConfig, OnDiskStorageConfig, SafetyRulesService, SecureBackend, SeedPeersConfig,
         TestConfig,
     },
     utils,
-};
-use libra_types::{
-    discovery_info::DiscoveryInfo, discovery_set::DiscoverySet, on_chain_config::ValidatorSet,
-    validator_info::ValidatorInfo,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
 pub struct ValidatorSwarm {
     pub nodes: Vec<NodeConfig>,
-    pub validator_set: ValidatorSet,
-    pub discovery_set: DiscoverySet,
 }
 
 pub fn validator_swarm(
@@ -31,8 +25,6 @@ pub fn validator_swarm(
     randomize_libranet_ports: bool,
 ) -> ValidatorSwarm {
     let mut rng = StdRng::from_seed(seed);
-    let mut validator_keys = Vec::new();
-    let mut discovery_infos = Vec::new();
     let mut nodes = Vec::new();
 
     for _index in 0..count {
@@ -44,7 +36,7 @@ pub fn validator_swarm(
         let mut storage_config = OnDiskStorageConfig::default();
         storage_config.default = true;
         node.consensus.safety_rules.service = SafetyRulesService::Thread;
-        node.consensus.safety_rules.backend = SafetyRulesBackend::OnDiskStorage(storage_config);
+        node.consensus.safety_rules.backend = SecureBackend::OnDiskStorage(storage_config);
 
         let network = node.validator_network.as_mut().unwrap();
         if randomize_libranet_ports {
@@ -52,31 +44,8 @@ pub fn validator_swarm(
             network.advertised_address = network.listen_address.clone();
         }
 
-        let test = node.test.as_ref().unwrap();
-        let consensus_pubkey = test.consensus_keypair.as_ref().unwrap().public().clone();
-        let network_keypairs = network
-            .network_keypairs
-            .as_ref()
-            .expect("Network keypairs are not defined");
-
-        validator_keys.push(ValidatorInfo::new(
-            network.peer_id,
-            consensus_pubkey,
-            1, // @TODO: Add support for dynamic weights
-            network_keypairs.signing_keys.public().clone(),
-            network_keypairs.identity_public_key(),
-        ));
-
-        // TODO(philiphayes): as a temporary hack, we'll just duplicate the
-        // validator info into the fullnode info until we can handle deserializing
-        // empty fullnode info.
-        discovery_infos.push(DiscoveryInfo {
-            account_address: network.peer_id,
-            validator_network_identity_pubkey: network_keypairs.identity_public_key(),
-            validator_network_address: network.advertised_address.clone(),
-            fullnodes_network_identity_pubkey: network_keypairs.identity_public_key(),
-            fullnodes_network_address: network.advertised_address.clone(),
-        });
+        // For a validator node, any of its validator peers are considered an upstream peer
+        node.upstream.primary_networks.push(network.peer_id);
 
         nodes.push(node);
     }
@@ -92,13 +61,7 @@ pub fn validator_swarm(
         network.seed_peers = seed_peers.clone();
     }
 
-    validator_keys.sort_by(|k1, k2| k1.account_address().cmp(k2.account_address()));
-    discovery_infos.sort_by(|k1, k2| k1.account_address.cmp(&k2.account_address));
-    ValidatorSwarm {
-        nodes,
-        validator_set: ValidatorSet::new(validator_keys),
-        discovery_set: DiscoverySet::new(discovery_infos),
-    }
+    ValidatorSwarm { nodes }
 }
 
 pub fn validator_swarm_for_testing(nodes: usize) -> ValidatorSwarm {

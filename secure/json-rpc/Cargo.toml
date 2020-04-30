@@ -11,7 +11,7 @@ edition = "2018"
 
 [dependencies]
 hex = "0.4.2"
-serde_json = "1.0.40"
+serde_json = "1.0.52"
 thiserror = "1.0"
 ureq = { version = "0.12.0", features = ["json"] }
 
@@ -32,5 +32,4 @@ libra-temppath = { path = "../../common/temppath", version = "0.1.0" }
 libra-types = { path = "../../types", version = "0.1.0", features = ["fuzzing"] }
 libradb = { path = "../../storage/libradb", version = "0.1.0" }
 storage-interface = { path = "../../storage/storage-interface", version = "0.1.0" }
-storage-proto = { path = "../../storage/storage-proto", version = "0.1.0" }
 vm-validator = { path = "../../vm-validator", version = "0.1.0" }

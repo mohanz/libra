@@ -85,6 +85,15 @@ impl Type {
         }
     }
 
+    /// Determines whether this is an immutable reference.
+    pub fn is_immutable_reference(&self) -> bool {
+        if let Type::Reference(false, _) = self {
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns true if this is any number type.
     pub fn is_number(&self) -> bool {
         if let Type::Primitive(p) = self {
@@ -121,7 +130,11 @@ impl Type {
 
     /// Instantiates type parameters in this type.
     pub fn instantiate(&self, params: &[Type]) -> Type {
-        self.replace(Some(params), None)
+        if params.is_empty() {
+            self.clone()
+        } else {
+            self.replace(Some(params), None)
+        }
     }
 
     /// A helper function to do replacement of type parameters and/or type variables.

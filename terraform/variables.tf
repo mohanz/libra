@@ -199,9 +199,10 @@ variable "safety_rules_image_tag" {
   default     = "latest"
 }
 
-variable "restore_vol_id" {
-  default     = ""
-  description = "volume id to restore validator data from"
+variable "restore_vol_ids" {
+  type        = list(string)
+  default     = []
+  description = "volume ids to restore validator data from"
 }
 
 variable "permissions_boundary_policy" {
@@ -229,4 +230,22 @@ variable "persist_libra_data" {
   type        = bool
   default     = true
   description = "Whether to persist libra data on validator and fullnode between restarts"
+}
+
+variable "override_validator_ips" {
+  type        = list(string)
+  default     = []
+  description = "List of private IPs for validators"
+}
+
+variable "override_fullnode_ips" {
+  type        = list(string)
+  default     = []
+  description = "List of private IPs for fullnodes"
+}
+
+variable "override_faucet_ip" {
+  type        = string
+  default     = ""
+  description = "Private IP for faucet"
 }

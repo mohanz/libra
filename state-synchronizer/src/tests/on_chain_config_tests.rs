@@ -2,14 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::executor_proxy::{ExecutorProxy, ExecutorProxyTrait};
-use executor::BlockExecutor;
-use executor_utils::{
-    create_storage_service_and_executor,
-    test_helpers::{
-        gen_block_id, gen_block_metadata, gen_ledger_info_with_sigs, get_test_signed_transaction,
-    },
+use executor::{db_bootstrapper::bootstrap_db_if_empty, BlockExecutor, Executor};
+use executor_utils::test_helpers::{
+    gen_block_id, gen_block_metadata, gen_ledger_info_with_sigs, get_test_signed_transaction,
 };
 use futures::{future::FutureExt, stream::StreamExt};
+use libra_config::utils::get_genesis_txn;
 use libra_crypto::{
     ed25519::*,
     traits::{PrivateKey, Uniform},
@@ -17,11 +15,14 @@ use libra_crypto::{
 };
 use libra_types::{
     account_config::{association_address, lbr_type_tag},
-    on_chain_config::{OnChainConfig, VMPublishingOption},
+    on_chain_config::{OnChainConfig, VMConfig, VMPublishingOption},
     transaction::authenticator::AuthenticationKey,
 };
-use std::sync::{Arc, Mutex};
+use libra_vm::LibraVM;
+use std::sync::Arc;
 use stdlib::transaction_scripts::StdlibScript;
+use storage_client::SyncStorageClient;
+use storage_service::{init_libra_db, start_storage_service_with_db};
 use subscription_service::ReconfigSubscription;
 use transaction_builder::{
     encode_block_prologue_script, encode_publishing_option_script,
@@ -33,17 +34,19 @@ use transaction_builder::{
 fn test_on_chain_config_pub_sub() {
     let mut rt = tokio::runtime::Runtime::new().unwrap();
     // set up reconfig subscription
-    let subscribed_configs = &[VMPublishingOption::CONFIG_ID];
+    let subscribed_configs = &[VMConfig::CONFIG_ID];
     let (subscription, mut reconfig_receiver) = ReconfigSubscription::subscribe(subscribed_configs);
 
     let (mut config, genesis_key) = config_builder::test_config();
-    let (_storage_server_handle, executor) = create_storage_service_and_executor(&config);
-    let executor = Arc::new(Mutex::new(executor));
-    let mut executor_proxy = rt.block_on(ExecutorProxy::new(
-        executor.clone(),
-        &config,
-        vec![subscription],
+    let (db, db_rw) = init_libra_db(&config);
+    let _storage = start_storage_service_with_db(&config, Arc::clone(&db));
+    bootstrap_db_if_empty::<LibraVM>(&db_rw, get_genesis_txn(&config).unwrap()).unwrap();
+
+    let mut block_executor = Box::new(Executor::<LibraVM>::new(
+        SyncStorageClient::new(&config.storage.address).into(),
     ));
+    let chunk_executor = Box::new(Executor::<LibraVM>::new(db_rw));
+    let mut executor_proxy = ExecutorProxy::new(db, chunk_executor, vec![subscription]);
 
     assert!(
         reconfig_receiver
@@ -54,13 +57,15 @@ fn test_on_chain_config_pub_sub() {
     );
 
     // start state sync with initial loading of on-chain configs
-    rt.block_on(executor_proxy.load_on_chain_configs())
+    executor_proxy
+        .load_on_chain_configs()
         .expect("failed to load on-chain configs");
 
     ////////////////////////////////////////////////////////
     // Case 1: don't publish for no reconfiguration event //
     ////////////////////////////////////////////////////////
-    rt.block_on(executor_proxy.publish_on_chain_config_updates(vec![]))
+    executor_proxy
+        .publish_on_chain_config_updates(vec![])
         .expect("failed to publish on-chain configs");
 
     assert_eq!(
@@ -84,7 +89,7 @@ fn test_on_chain_config_pub_sub() {
         .unwrap();
 
     let validator_privkey = keys.take_private().unwrap();
-    let validator_pubkey = keys.public().clone();
+    let validator_pubkey = keys.public_key();
     let auth_key = AuthenticationKey::ed25519(&validator_pubkey);
     let validator_auth_key_prefix = auth_key.prefix().to_vec();
 
@@ -111,11 +116,9 @@ fn test_on_chain_config_pub_sub() {
 
     let block1 = vec![txn1, txn2];
     let block1_id = gen_block_id(1);
-    let parent_block_id = executor.lock().unwrap().committed_block_id();
+    let parent_block_id = block_executor.committed_block_id();
 
-    let output = executor
-        .lock()
-        .unwrap()
+    let output = block_executor
         .execute_block((block1_id, block1), parent_block_id)
         .expect("failed to execute block");
     assert!(
@@ -123,23 +126,22 @@ fn test_on_chain_config_pub_sub() {
         "execution missing reconfiguration"
     );
 
-    let ledger_info_with_sigs = gen_ledger_info_with_sigs(2, output.root_hash(), block1_id);
-    let (_, reconfig_events) = executor
-        .lock()
-        .unwrap()
+    let ledger_info_with_sigs = gen_ledger_info_with_sigs(1, output, block1_id, vec![]);
+    let (_, reconfig_events) = block_executor
         .commit_blocks(vec![block1_id], ledger_info_with_sigs)
         .unwrap();
     assert!(
         !reconfig_events.is_empty(),
         "expected reconfig events from executor commit"
     );
-    rt.block_on(executor_proxy.publish_on_chain_config_updates(reconfig_events))
+    executor_proxy
+        .publish_on_chain_config_updates(reconfig_events)
         .expect("failed to publish on-chain configs");
 
     let receive_reconfig = async {
         let payload = reconfig_receiver.select_next_some().await;
-        let received_config = payload.get::<VMPublishingOption>().unwrap();
-        assert_eq!(received_config, vm_publishing_option);
+        let received_config = payload.get::<VMConfig>().unwrap();
+        assert_eq!(received_config.publishing_option, vm_publishing_option);
     };
 
     rt.block_on(receive_reconfig);
@@ -180,20 +182,16 @@ fn test_on_chain_config_pub_sub() {
     let block2 = vec![txn3, txn4, txn5];
     let block2_id = gen_block_id(2);
 
-    let output = executor
-        .lock()
-        .unwrap()
-        .execute_block((block2_id, block2), block1_id)
+    let output = block_executor
+        .execute_block((block2_id, block2), block_executor.committed_block_id())
         .expect("failed to execute block");
     assert!(
         output.has_reconfiguration(),
         "execution missing reconfiguration"
     );
 
-    let ledger_info_with_sigs = gen_ledger_info_with_sigs(5, output.root_hash(), block2_id);
-    let (_, reconfig_events) = executor
-        .lock()
-        .unwrap()
+    let ledger_info_with_sigs = gen_ledger_info_with_sigs(2, output, block2_id, vec![]);
+    let (_, reconfig_events) = block_executor
         .commit_blocks(vec![block2_id], ledger_info_with_sigs)
         .unwrap();
     assert!(
@@ -201,7 +199,8 @@ fn test_on_chain_config_pub_sub() {
         "expected reconfig events from executor commit"
     );
 
-    rt.block_on(executor_proxy.publish_on_chain_config_updates(reconfig_events))
+    executor_proxy
+        .publish_on_chain_config_updates(reconfig_events)
         .expect("failed to publish on-chain configs");
 
     assert_eq!(

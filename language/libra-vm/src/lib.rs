@@ -104,7 +104,6 @@
 extern crate mirai_annotations;
 #[macro_use]
 mod counters;
-pub mod on_chain_configs;
 
 #[cfg(feature = "mirai-contracts")]
 pub mod foreign_contracts;
@@ -123,8 +122,8 @@ use libra_types::{
     vm_error::VMStatus,
 };
 
-/// This trait describes the VM's verification interfaces.
-pub trait VMVerifier {
+/// This trait describes the VM's validation interfaces.
+pub trait VMValidator {
     /// Executes the prologue of the Libra Account and verifies that the transaction is valid.
     /// only. Returns `None` if the transaction was validated, or Some(VMStatus) if the transaction
     /// was unable to be validated with status `VMStatus`.
@@ -136,7 +135,7 @@ pub trait VMVerifier {
 }
 
 /// This trait describes the VM's execution interface.
-pub trait VMExecutor {
+pub trait VMExecutor: Send {
     // NOTE: At the moment there are no persistent caches that live past the end of a block (that's
     // why execute_block doesn't take &self.)
     // There are some cache invalidation issues around transactions publishing code that need to be

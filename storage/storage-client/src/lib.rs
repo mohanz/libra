@@ -9,22 +9,19 @@
 //! library implementation and protobuf interface, and the interface between the rest of the system
 //! and the client library will remain the same, so we won't need to change other components.
 
-mod state_view;
-
-pub use crate::state_view::VerifiedStateView;
 use anyhow::{format_err, Error, Result};
 use futures::{
     executor::block_on,
     stream::{BoxStream, StreamExt},
 };
 use libra_crypto::HashValue;
-use libra_secure_net::NetworkClient;
 use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
     account_state::AccountState,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::ContractEvent,
+    epoch_change::EpochChangeProof,
     event::EventKey,
     get_with_proof::{
         RequestItem, ResponseItem, UpdateToLatestLedgerRequest, UpdateToLatestLedgerResponse,
@@ -32,16 +29,14 @@ use libra_types::{
     ledger_info::LedgerInfoWithSignatures,
     proof::{AccumulatorConsistencyProof, SparseMerkleProof, SparseMerkleRangeProof},
     transaction::{TransactionListWithProof, TransactionToCommit, TransactionWithProof, Version},
-    validator_change::ValidatorChangeProof,
 };
-use serde::de::DeserializeOwned;
 use std::{
     collections::{HashMap, HashSet},
     convert::TryFrom,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use storage_interface::{DbReader, DbWriter};
+use storage_interface::{DbReader, DbWriter, StartupInfo, TreeState};
 use storage_proto::{
     proto::storage::{
         storage_client::StorageClient, GetLatestStateRootRequest, GetStartupInfoRequest,
@@ -52,63 +47,9 @@ use storage_proto::{
     GetAccountStateWithProofByVersionRequest, GetAccountStateWithProofByVersionResponse,
     GetEpochChangeLedgerInfosRequest, GetLatestAccountStateRequest, GetLatestAccountStateResponse,
     GetLatestStateRootResponse, GetStartupInfoResponse, GetTransactionsRequest,
-    GetTransactionsResponse, SaveTransactionsRequest, StartupInfo,
+    GetTransactionsResponse, SaveTransactionsRequest,
 };
 use tokio::runtime::Runtime;
-
-pub struct SimpleStorageClient {
-    network_client: Mutex<NetworkClient>,
-}
-
-impl SimpleStorageClient {
-    pub fn new(server_address: &SocketAddr) -> Self {
-        Self {
-            network_client: Mutex::new(NetworkClient::new(*server_address)),
-        }
-    }
-
-    fn request<T: DeserializeOwned>(
-        &self,
-        input: storage_interface::StorageRequest,
-    ) -> Result<T, storage_interface::Error> {
-        let input_message = lcs::to_bytes(&input)?;
-        let mut client = self.network_client.lock().unwrap();
-        client.write(&input_message)?;
-        let result = client.read()?;
-        lcs::from_bytes(&result)?
-    }
-
-    pub fn get_account_state_with_proof_by_version(
-        &self,
-        address: AccountAddress,
-        version: Version,
-    ) -> Result<(Option<AccountStateBlob>, SparseMerkleProof), storage_interface::Error> {
-        self.request(
-            storage_interface::StorageRequest::GetAccountStateWithProofByVersionRequest(Box::new(
-                storage_interface::GetAccountStateWithProofByVersionRequest::new(address, version),
-            )),
-        )
-    }
-
-    pub fn get_startup_info(&self) -> Result<Option<StartupInfo>, storage_interface::Error> {
-        self.request(storage_interface::StorageRequest::GetStartupInfoRequest)
-    }
-
-    pub fn save_transactions(
-        &self,
-        txns_to_commit: Vec<TransactionToCommit>,
-        first_version: Version,
-        ledger_info_with_sigs: Option<LedgerInfoWithSignatures>,
-    ) -> Result<(), storage_interface::Error> {
-        self.request(storage_interface::StorageRequest::SaveTransactionsRequest(
-            Box::new(storage_interface::SaveTransactionsRequest::new(
-                txns_to_commit,
-                first_version,
-                ledger_info_with_sigs,
-            )),
-        ))
-    }
-}
 
 /// This provides storage read interfaces backed by real storage service.
 pub struct StorageReadServiceClient {
@@ -149,7 +90,7 @@ impl StorageRead for StorageReadServiceClient {
     ) -> Result<(
         Vec<ResponseItem>,
         LedgerInfoWithSignatures,
-        ValidatorChangeProof,
+        EpochChangeProof,
         AccumulatorConsistencyProof,
     )> {
         let req: libra_types::proto::types::UpdateToLatestLedgerRequest =
@@ -168,7 +109,7 @@ impl StorageRead for StorageReadServiceClient {
         Ok((
             rust_resp.response_items,
             rust_resp.ledger_info_with_sigs,
-            rust_resp.validator_change_proof,
+            rust_resp.epoch_change_proof,
             rust_resp.ledger_consistency_proof,
         ))
     }
@@ -254,7 +195,7 @@ impl StorageRead for StorageReadServiceClient {
         &self,
         start_epoch: u64,
         end_epoch: u64,
-    ) -> Result<ValidatorChangeProof> {
+    ) -> Result<EpochChangeProof> {
         let proto_req: storage_proto::proto::storage::GetEpochChangeLedgerInfosRequest =
             GetEpochChangeLedgerInfosRequest::new(start_epoch, end_epoch).into();
         let resp = self
@@ -263,7 +204,7 @@ impl StorageRead for StorageReadServiceClient {
             .get_epoch_change_ledger_infos(proto_req)
             .await?
             .into_inner();
-        let resp = ValidatorChangeProof::try_from(resp)?;
+        let resp = EpochChangeProof::try_from(resp)?;
         Ok(resp)
     }
 
@@ -459,7 +400,7 @@ pub trait StorageRead: Send + Sync {
     ) -> Result<(
         Vec<ResponseItem>,
         LedgerInfoWithSignatures,
-        ValidatorChangeProof,
+        EpochChangeProof,
         AccumulatorConsistencyProof,
     )>;
 
@@ -513,7 +454,7 @@ pub trait StorageRead: Send + Sync {
         &self,
         start_epoch: u64,
         end_epoch: u64,
-    ) -> Result<ValidatorChangeProof>;
+    ) -> Result<EpochChangeProof>;
 
     /// See [`LibraDB::backup_account_state`].
     ///
@@ -647,7 +588,7 @@ impl DbReader for SyncStorageClient {
         &self,
         _known_version: u64,
         _ledger_info_with_sigs: LedgerInfoWithSignatures,
-    ) -> Result<(ValidatorChangeProof, AccumulatorConsistencyProof)> {
+    ) -> Result<(EpochChangeProof, AccumulatorConsistencyProof)> {
         unimplemented!()
     }
 
@@ -656,7 +597,7 @@ impl DbReader for SyncStorageClient {
         _known_version: u64,
     ) -> Result<(
         LedgerInfoWithSignatures,
-        ValidatorChangeProof,
+        EpochChangeProof,
         AccumulatorConsistencyProof,
     )> {
         unimplemented!()
@@ -690,6 +631,22 @@ impl DbReader for SyncStorageClient {
             self.rt
                 .spawn(async move { reader.get_latest_state_root().await }),
         )?
+    }
+
+    fn get_latest_tree_state(&self) -> Result<TreeState> {
+        unimplemented!()
+    }
+
+    fn get_epoch_change_ledger_infos(
+        &self,
+        _start_epoch: u64,
+        _end_epoch: u64,
+    ) -> Result<EpochChangeProof> {
+        unimplemented!()
+    }
+
+    fn get_ledger_info(&self, _known_version: u64) -> Result<LedgerInfoWithSignatures> {
+        unimplemented!()
     }
 }
 

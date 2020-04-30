@@ -18,11 +18,8 @@ use consensus_types::{
 use libra_crypto::{ed25519::Ed25519Signature, hash::HashValue};
 use libra_logger::debug;
 use libra_types::{
-    block_info::BlockInfo,
-    ledger_info::LedgerInfo,
-    validator_change::{ValidatorChangeProof, VerifierType},
-    validator_signer::ValidatorSigner,
-    validator_verifier::ValidatorVerifier,
+    block_info::BlockInfo, epoch_change::EpochChangeProof, ledger_info::LedgerInfo,
+    validator_signer::ValidatorSigner, validator_verifier::ValidatorVerifier, waypoint::Waypoint,
 };
 use std::marker::PhantomData;
 
@@ -81,8 +78,52 @@ impl<T: Payload> SafetyRules<T> {
         }
     }
 
-    pub fn signer(&self) -> &ValidatorSigner {
-        &self.validator_signer
+    /// This verifies a QC makes sense in the current context, specifically that this is for the
+    /// current epoch and extends from the preffered round.
+    fn verify_qc(&self, qc: &QuorumCert) -> Result<(), Error> {
+        let validator_verifier = self
+            .validator_verifier
+            .as_ref()
+            .ok_or(Error::NotInitialized)?;
+
+        qc.verify(validator_verifier)
+            .map_err(|e| Error::InvalidQuorumCertificate(e.to_string()))?;
+
+        if qc.parent_block().round() < self.persistent_storage.preferred_round()? {
+            Err(Error::InvalidQuorumCertificate(
+                "Preferred round too early".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// This sets the current validator verifier and updates the epoch and round information
+    /// if this is a new epoch ending ledger info. It also sets the current waypoint to this
+    /// LedgerInfo.
+    /// @TODO if public key does not match private key in validator set, access persistent storage
+    /// to identify new key
+    fn start_new_epoch(&mut self, ledger_info: &LedgerInfo) -> Result<(), Error> {
+        let epoch_info = ledger_info.next_epoch_info().cloned();
+        self.validator_verifier = Some(epoch_info.ok_or(Error::InvalidLedgerInfo)?.verifier);
+
+        let current_epoch = self.persistent_storage.epoch()?;
+        let next_epoch = ledger_info.epoch() + 1;
+
+        if current_epoch < next_epoch {
+            // This is ordered specifically to avoid configuration issues:
+            // * First set the waypoint to lock in the minimum restarting point,
+            // * set the round information,
+            // * finally, set the epoch information because once the epoch is set, this `if`
+            // statement cannot be re-entered.
+            self.persistent_storage
+                .set_waypoint(&Waypoint::new_epoch_boundary(ledger_info)?)?;
+            self.persistent_storage.set_last_voted_round(0)?;
+            self.persistent_storage.set_preferred_round(0)?;
+            self.persistent_storage.set_epoch(ledger_info.epoch() + 1)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -96,42 +137,25 @@ impl<T: Payload> TSafetyRules<T> for SafetyRules<T> {
         ))
     }
 
-    fn initialize(&mut self, proof: &ValidatorChangeProof) -> Result<(), Error> {
+    fn initialize(&mut self, proof: &EpochChangeProof) -> Result<(), Error> {
         let waypoint = self.persistent_storage.waypoint()?;
         let last_li = proof
-            .verify(&VerifierType::Waypoint(waypoint))
+            .verify(&waypoint)
             .map_err(|e| Error::WaypointMismatch(format!("{}", e)))?;
-        let validator_set = last_li.ledger_info().next_validator_set();
-        self.validator_verifier = Some(validator_set.ok_or(Error::InvalidLedgerInfo)?.into());
-        Ok(())
+        self.start_new_epoch(last_li.ledger_info())
     }
 
-    /// @TODO verify signatures of the QC, also the special genesis QC
-    /// @TODO improving signaling by stating reaction to passed in QC:
-    ///     QC has older preferred round,
-    ///     signatures are incorrect,
-    ///     epoch is unexpected
-    ///     updating to new preferred round
-    /// @TODO update epoch with validator set
-    /// @TODO if public key does not match private key in validator set, access persistent storage
-    /// to identify new key
+    /// Verify the QC is correct and up to date, if it is either set the preferred round or start a
+    /// new epoch.
     fn update(&mut self, qc: &QuorumCert) -> Result<(), Error> {
-        if qc.parent_block().round() > self.persistent_storage.preferred_round()? {
+        self.verify_qc(qc)?;
+        if qc.ends_epoch() {
+            self.start_new_epoch(qc.ledger_info().ledger_info())
+        } else {
             self.persistent_storage
-                .set_preferred_round(qc.parent_block().round())?;
+                .set_preferred_round(qc.parent_block().round())
+                .map_err(|e| e.into())
         }
-        Ok(())
-    }
-
-    fn start_new_epoch(&mut self, qc: &QuorumCert) -> Result<(), Error> {
-        if qc.commit_info().epoch() > self.persistent_storage.epoch()? {
-            self.persistent_storage
-                .set_epoch(qc.commit_info().epoch())?;
-            self.persistent_storage.set_last_voted_round(0)?;
-            self.persistent_storage.set_preferred_round(0)?;
-        }
-        self.update(qc)?;
-        Ok(())
     }
 
     /// @TODO verify signature on vote proposal
@@ -184,7 +208,7 @@ impl<T: Payload> TSafetyRules<T> for SafetyRules<T> {
                 proposed_block.gen_block_info(
                     new_tree.root_hash(),
                     new_tree.version(),
-                    vote_proposal.next_validator_set().cloned(),
+                    vote_proposal.next_epoch_info().cloned(),
                 ),
                 proposed_block.quorum_cert().certified_block().clone(),
             ),

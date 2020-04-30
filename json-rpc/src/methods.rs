@@ -5,23 +5,28 @@
 use crate::{
     errors::JsonRpcError,
     views::{
-        AccountStateWithProofView, AccountView, BlockMetadata, EventView, StateProofView,
-        TransactionView,
+        AccountStateWithProofView, AccountView, BlockMetadata, CurrencyInfoView, EventView,
+        StateProofView, TransactionView,
     },
 };
 use anyhow::{ensure, format_err, Error, Result};
 use core::future::Future;
 use debug_interface::prelude::*;
 use futures::{channel::oneshot, SinkExt};
-use hex;
 use libra_mempool::MempoolClientSender;
 use libra_types::{
-    account_address::AccountAddress, account_state::AccountState, event::EventKey,
-    ledger_info::LedgerInfoWithSignatures, mempool_status::MempoolStatusCode,
+    account_address::AccountAddress,
+    account_config::CurrencyInfoResource,
+    account_state::AccountState,
+    event::EventKey,
+    ledger_info::LedgerInfoWithSignatures,
+    mempool_status::MempoolStatusCode,
+    move_resource::MoveStorage,
+    on_chain_config::{OnChainConfig, RegisteredCurrencies},
     transaction::SignedTransaction,
 };
 use serde_json::Value;
-use std::{collections::HashMap, convert::TryFrom, pin::Pin, str::FromStr, sync::Arc};
+use std::{collections::HashMap, convert::TryFrom, ops::Deref, pin::Pin, str::FromStr, sync::Arc};
 use storage_interface::DbReader;
 
 #[derive(Clone)]
@@ -51,6 +56,8 @@ pub(crate) struct JsonRpcRequest {
 }
 
 impl JsonRpcRequest {
+    /// Returns the request parameter at the given index. Note: this method should not panic with
+    /// an out of bounds error, as the number of request parameters has already been checked.
     fn get_param(&self, index: usize) -> Value {
         self.params[index].clone()
     }
@@ -231,6 +238,35 @@ async fn get_events(service: JsonRpcService, request: JsonRpcRequest) -> Result<
     Ok(events)
 }
 
+/// Returns meta information about supported currencies
+async fn currencies_info(
+    service: JsonRpcService,
+    request: JsonRpcRequest,
+) -> Result<Vec<CurrencyInfoView>> {
+    let raw_data = service.db.deref().batch_fetch_resources_by_version(
+        vec![RegisteredCurrencies::CONFIG_ID.access_path()],
+        request.version(),
+    )?;
+    ensure!(raw_data.len() == 1, "invalid storage result");
+    let currencies = RegisteredCurrencies::from_bytes(&raw_data[0])?;
+    let access_paths: Vec<_> = currencies
+        .currency_codes()
+        .iter()
+        .map(|code| CurrencyInfoResource::resource_path_for(code.clone()))
+        .collect();
+
+    let mut currencies = vec![];
+    for raw_data in service
+        .db
+        .deref()
+        .batch_fetch_resources_by_version(access_paths, request.version())?
+    {
+        let currency_info = CurrencyInfoResource::try_from_bytes(&raw_data)?;
+        currencies.push(CurrencyInfoView::from(currency_info));
+    }
+    Ok(currencies)
+}
+
 /// Returns proof of new state relative to version known to client
 async fn get_state_proof(
     service: JsonRpcService,
@@ -243,14 +279,21 @@ async fn get_state_proof(
     StateProofView::try_from((request.ledger_info, proofs.0, proofs.1))
 }
 
+/// Returns the account state to the client, alongside a proof relative to the version and
+/// ledger_version specified by the client. If version or ledger_version are not specified,
+/// the latest known versions will be used.
 async fn get_account_state_with_proof(
     service: JsonRpcService,
     request: JsonRpcRequest,
 ) -> Result<AccountStateWithProofView> {
     let address: String = serde_json::from_value(request.get_param(0))?;
     let account_address = AccountAddress::from_str(&address)?;
-    let version: u64 = serde_json::from_value(request.get_param(1))?;
-    let ledger_version: u64 = serde_json::from_value(request.get_param(2))?;
+
+    // If versions are specified by the request parameters, use them, otherwise use the defaults
+    let version =
+        serde_json::from_value::<u64>(request.get_param(1)).unwrap_or_else(|_| request.version());
+    let ledger_version =
+        serde_json::from_value::<u64>(request.get_param(2)).unwrap_or_else(|_| request.version());
 
     let account_state_with_proof =
         service
@@ -272,6 +315,7 @@ pub(crate) fn build_registry() -> RpcRegistry {
     register_rpc_method!(registry, get_transactions, 3);
     register_rpc_method!(registry, get_account_transaction, 3);
     register_rpc_method!(registry, get_events, 3);
+    register_rpc_method!(registry, currencies_info, 0);
 
     register_rpc_method!(registry, get_state_proof, 1);
     register_rpc_method!(registry, get_account_state_with_proof, 3);

@@ -21,7 +21,7 @@ mod socket;
 pub use self::socket::noise_fuzzing;
 
 pub use self::socket::NoiseSocket;
-use libra_crypto::{x25519, ValidKey};
+use libra_crypto::{x25519, ValidCryptoMaterial};
 
 const NOISE_IX_25519_AESGCM_SHA256_PROTOCOL_NAME: &[u8] = b"/noise_ix_25519_aesgcm_sha256/1.0.0";
 const NOISE_PARAMETER: &str = "Noise_IX_25519_AESGCM_SHA256";
@@ -42,9 +42,10 @@ impl NoiseConfig {
 
     /// Create a new NoiseConfig with an ephemeral static key.
     #[cfg(feature = "testing")]
-    pub fn new_random(rng: &mut (impl rand::RngCore + rand::CryptoRng)) -> Self {
+    pub fn new_random(rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng)) -> Self {
         let parameters: NoiseParams = NOISE_PARAMETER.parse().expect("Invalid protocol name");
-        let key = x25519::PrivateKey::for_test(rng);
+        use libra_crypto::Uniform;
+        let key = x25519::PrivateKey::generate(rng);
         Self { key, parameters }
     }
 

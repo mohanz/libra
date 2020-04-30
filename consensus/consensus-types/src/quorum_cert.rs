@@ -65,7 +65,7 @@ impl QuorumCert {
     pub fn ends_epoch(&self) -> bool {
         self.signed_ledger_info
             .ledger_info()
-            .next_validator_set()
+            .next_epoch_info()
             .is_some()
     }
 
@@ -123,6 +123,7 @@ impl QuorumCert {
         self.ledger_info()
             .verify_signatures(validator)
             .context("Fail to verify QuorumCert")?;
+        self.vote_data.verify()?;
         Ok(())
     }
 }

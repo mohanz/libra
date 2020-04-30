@@ -49,7 +49,7 @@ const L: [u8; 32] = [
 ];
 
 /// An Ed25519 private key
-#[derive(DeserializeKey, SilentDisplay, SilentDebug, SerializeKey)]
+#[derive(DeserializeKey, SerializeKey, SilentDebug, SilentDisplay)]
 pub struct Ed25519PrivateKey(ed25519_dalek::SecretKey);
 
 #[cfg(feature = "assert-private-keys-not-cloneable")]
@@ -181,7 +181,7 @@ impl SigningKey for Ed25519PrivateKey {
 impl Uniform for Ed25519PrivateKey {
     fn generate<R>(rng: &mut R) -> Self
     where
-        R: ::rand::SeedableRng + ::rand::RngCore + ::rand::CryptoRng,
+        R: ::rand::RngCore + ::rand::CryptoRng,
     {
         Ed25519PrivateKey(ed25519_dalek::SecretKey::generate(rng))
     }
@@ -217,7 +217,7 @@ impl Length for Ed25519PrivateKey {
     }
 }
 
-impl ValidKey for Ed25519PrivateKey {
+impl ValidCryptoMaterial for Ed25519PrivateKey {
     fn to_bytes(&self) -> Vec<u8> {
         self.to_bytes().to_vec()
     }
@@ -323,7 +323,7 @@ impl Length for Ed25519PublicKey {
     }
 }
 
-impl ValidKey for Ed25519PublicKey {
+impl ValidCryptoMaterial for Ed25519PublicKey {
     fn to_bytes(&self) -> Vec<u8> {
         self.0.to_bytes().to_vec()
     }
@@ -390,7 +390,7 @@ impl Length for Ed25519Signature {
     }
 }
 
-impl ValidKey for Ed25519Signature {
+impl ValidCryptoMaterial for Ed25519Signature {
     fn to_bytes(&self) -> Vec<u8> {
         self.to_bytes().to_vec()
     }

@@ -14,6 +14,7 @@ use termion::{color, style};
 
 use anyhow::{bail, format_err, Result};
 use cluster_test::{
+    aws,
     cluster::Cluster,
     cluster_swarm::{cluster_swarm_kube::ClusterSwarmKube, ClusterSwarm},
     experiments::{get_experiment, Context, Experiment},
@@ -38,7 +39,6 @@ use tokio::{
     runtime::{Builder, Runtime},
     time::{delay_for, delay_until, Instant as TokioInstant},
 };
-
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(StructOpt, Debug)]
@@ -167,6 +167,8 @@ pub fn main() {
             &runner.cluster,
         ));
         runner.cleanup();
+        runner.teardown();
+
         result.unwrap();
         info!(
             "{}Experiment Result: {}{}",
@@ -379,6 +381,23 @@ impl ClusterUtil {
                 "Deploying with {} tag for validators and fullnodes",
                 image_tag
             );
+            let asg_name = format!(
+                "{}-k8s-testnet-validators",
+                cluster_swarm
+                    .get_workspace()
+                    .await
+                    .expect("Failed to get workspace")
+            );
+            aws::set_asg_size(
+                (args.k8s_num_validators
+                    + (args.k8s_fullnodes_per_validator * args.k8s_num_validators))
+                    as i64,
+                5.0,
+                &asg_name,
+                true,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{} scaling failed", asg_name));
             cluster_swarm
                 .create_validator_and_fullnode_set(
                     args.k8s_num_validators,
@@ -460,6 +479,17 @@ impl ClusterUtil {
 }
 
 impl ClusterTestRunner {
+    pub fn teardown(&mut self) {
+        let workspace = self
+            .runtime
+            .block_on(self.cluster_swarm.get_workspace())
+            .expect("Failed to get workspace");
+        let asg_name = format!("{}-k8s-testnet-validators", workspace);
+        self.runtime
+            .block_on(aws::set_asg_size(0, 0.0, &asg_name, false))
+            .unwrap_or_else(|_| panic!("{} scaling failed", asg_name));
+    }
+
     /// Discovers cluster, setup log, etc
     pub fn setup(args: &Args) -> Self {
         let util = ClusterUtil::setup(args);
@@ -583,10 +613,13 @@ impl ClusterTestRunner {
         let suite_started = Instant::now();
         for experiment in suite.experiments {
             let experiment_name = format!("{}", experiment);
-            self.run_single_experiment(experiment, None)
-                .map_err(move |e| {
-                    format_err!("Experiment `{}` failed: `{}`", experiment_name, e)
-                })?;
+            let result = self
+                .run_single_experiment(experiment, None)
+                .map_err(move |e| format_err!("Experiment `{}` failed: `{}`", experiment_name, e));
+            if result.is_err() {
+                self.teardown();
+                return result;
+            }
             thread::sleep(self.experiment_interval);
         }
         info!(
@@ -594,6 +627,7 @@ impl ClusterTestRunner {
             Instant::now().duration_since(suite_started)
         );
         self.print_report();
+        self.teardown();
         Ok(())
     }
 

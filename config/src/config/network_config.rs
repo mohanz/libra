@@ -3,7 +3,7 @@
 
 use crate::{
     config::{PersistableConfig, RoleType, RootPath},
-    keys::{KeyPair, PrivateKeyContainer},
+    keys::KeyPair,
     utils,
 };
 use anyhow::{anyhow, ensure, Result};
@@ -11,8 +11,8 @@ use libra_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     x25519, Uniform,
 };
+use libra_network_address::NetworkAddress;
 use libra_types::{transaction::authenticator::AuthenticationKey, PeerId};
-use parity_multiaddr::Multiaddr;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, convert::TryFrom, path::PathBuf, string::ToString};
@@ -27,9 +27,9 @@ pub struct NetworkConfig {
     pub peer_id: PeerId,
     // TODO: Add support for multiple listen/advertised addresses in config.
     // The address that this node is listening on for new connections.
-    pub listen_address: Multiaddr,
+    pub listen_address: NetworkAddress,
     // The address that this node advertises to other nodes for the discovery protocol.
-    pub advertised_address: Multiaddr,
+    pub advertised_address: NetworkAddress,
     pub discovery_interval_ms: u64,
     pub connectivity_check_interval_ms: u64,
     // Flag to toggle if Noise is used for encryption and authentication.
@@ -38,6 +38,8 @@ pub struct NetworkConfig {
     // Otherwise, any node can connect. If this flag is set to true, `enable_noise` must
     // also be set to true.
     pub enable_remote_authentication: bool,
+    // Enable this network to use either gossip discovery or onchain discovery.
+    pub discovery_method: DiscoveryMethod,
     // network peers are the nodes allowed to connect when the network is started in authenticated
     // mode.
     #[serde(skip)]
@@ -54,12 +56,13 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             peer_id: PeerId::default(),
-            listen_address: "/ip4/0.0.0.0/tcp/6180".parse::<Multiaddr>().unwrap(),
-            advertised_address: "/ip4/127.0.0.1/tcp/6180".parse::<Multiaddr>().unwrap(),
+            listen_address: "/ip4/0.0.0.0/tcp/6180".parse().unwrap(),
+            advertised_address: "/ip4/127.0.0.1/tcp/6180".parse().unwrap(),
             discovery_interval_ms: 1000,
             connectivity_check_interval_ms: 5000,
             enable_noise: true,
             enable_remote_authentication: true,
+            discovery_method: DiscoveryMethod::Gossip,
             network_keypairs: None,
             network_peers_file: PathBuf::new(),
             network_peers: NetworkPeersConfig::default(),
@@ -81,6 +84,7 @@ impl NetworkConfig {
             connectivity_check_interval_ms: self.connectivity_check_interval_ms,
             enable_noise: self.enable_noise,
             enable_remote_authentication: self.enable_remote_authentication,
+            discovery_method: self.discovery_method,
             network_keypairs: None,
             network_peers_file: self.network_peers_file.clone(),
             network_peers: self.network_peers.clone(),
@@ -126,7 +130,7 @@ impl NetworkConfig {
 
         // TODO(joshlind): investigate the implications of removing these checks.
         if let Some(network_keypairs) = &self.network_keypairs {
-            let identity_public_key = network_keypairs.identity_public_key();
+            let identity_public_key = network_keypairs.identity_keypair.public_key();
             let peer_id = AuthenticationKey::try_from(identity_public_key.as_slice())
                 .unwrap()
                 .derived_address();
@@ -175,12 +179,12 @@ impl NetworkConfig {
 
     pub fn random_with_peer_id(&mut self, rng: &mut StdRng, peer_id: Option<PeerId>) {
         let signing_key = Ed25519PrivateKey::generate(rng);
-        let identity_key = x25519::PrivateKey::for_test(rng);
+        let identity_key = x25519::PrivateKey::generate(rng);
         let network_keypairs = NetworkKeyPairs::load(identity_key, signing_key);
         self.peer_id = if let Some(peer_id) = peer_id {
             peer_id
         } else {
-            let identity_public_key = network_keypairs.identity_public_key();
+            let identity_public_key = network_keypairs.identity_keypair.public_key();
             AuthenticationKey::try_from(identity_public_key.as_slice())
                 .unwrap()
                 .derived_address()
@@ -193,24 +197,24 @@ impl NetworkConfig {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct SeedPeersConfig {
     // All peers config. Key:a unique peer id, will be PK in future, Value: peer discovery info
-    pub seed_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    pub seed_peers: HashMap<PeerId, Vec<NetworkAddress>>,
 }
 
 // Leveraged to store the network keypairs together on disk separate from this config
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct NetworkKeyPairs {
-    pub identity_private_key: PrivateKeyContainer<x25519::PrivateKey>,
-    #[serde(skip)]
-    identity_public_key: Option<x25519::PublicKey>,
-    pub signing_keys: KeyPair<Ed25519PrivateKey>,
+    #[serde(rename = "identity_private_key")]
+    pub identity_keypair: KeyPair<x25519::PrivateKey>,
+    #[serde(rename = "signing_private_key")]
+    pub signing_keypair: KeyPair<Ed25519PrivateKey>,
 }
 
 #[cfg(any(test, feature = "fuzzing"))]
 impl PartialEq for NetworkKeyPairs {
     fn eq(&self, other: &Self) -> bool {
-        self.identity_private_key == other.identity_private_key
-            && self.signing_keys == other.signing_keys
+        self.identity_keypair == other.identity_keypair
+            && self.signing_keypair == other.signing_keypair
     }
 }
 
@@ -220,27 +224,17 @@ impl NetworkKeyPairs {
         identity_private_key: x25519::PrivateKey,
         signing_private_key: Ed25519PrivateKey,
     ) -> Self {
-        let identity_public_key = Some(identity_private_key.public_key());
         Self {
-            identity_private_key: PrivateKeyContainer::Present(identity_private_key),
-            identity_public_key,
-            signing_keys: KeyPair::load(signing_private_key),
+            identity_keypair: KeyPair::load(identity_private_key),
+            signing_keypair: KeyPair::load(signing_private_key),
         }
     }
 
     pub fn as_peer_info(&self) -> NetworkPeerInfo {
         NetworkPeerInfo {
-            identity_public_key: self.identity_public_key(),
-            signing_public_key: self.signing_keys.public().clone(),
+            identity_public_key: self.identity_keypair.public_key(),
+            signing_public_key: self.signing_keypair.public_key(),
         }
-    }
-
-    pub fn identity_public_key(&self) -> x25519::PublicKey {
-        self.identity_public_key.unwrap_or_else(|| {
-            self.identity_private_key
-                .public_key()
-                .expect("identity private key should be present")
-        })
     }
 }
 
@@ -263,6 +257,15 @@ pub struct NetworkPeerInfo {
     pub signing_public_key: Ed25519PublicKey,
     #[serde(rename = "ni")]
     pub identity_public_key: x25519::PublicKey,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryMethod {
+    // default until we can deprecate
+    Gossip,
+    Onchain,
+    None,
 }
 
 #[cfg(test)]
@@ -386,8 +389,8 @@ mod test {
         let root_dir = RootPath::new_path(path.path());
 
         // Now reset IP addresses and save
-        config.listen_address = Multiaddr::empty();
-        config.advertised_address = Multiaddr::empty();
+        config.listen_address = NetworkAddress::mock();
+        config.advertised_address = NetworkAddress::mock();
         config.save(&root_dir).unwrap();
 
         // Now load and verify default IP addresses are generated

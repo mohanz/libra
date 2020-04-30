@@ -19,8 +19,8 @@ use libra_config::config::RoleType;
 use libra_crypto::{
     ed25519::Ed25519PrivateKey, test_utils::TEST_SEED, x25519, PrivateKey, Uniform,
 };
+use libra_network_address::NetworkAddress;
 use libra_types::PeerId;
-use parity_multiaddr::Multiaddr;
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
@@ -97,7 +97,7 @@ pub struct DummyNetwork {
 
 /// The following sets up a 2 peer network and verifies connectivity.
 pub fn setup_network() -> DummyNetwork {
-    let any: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let any: NetworkAddress = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let runtime = Runtime::new().unwrap();
     let (dialer_peer_id, dialer_addr) = (PeerId::random(), any.clone());
     let (listener_peer_id, listener_addr) = (PeerId::random(), any);
@@ -106,13 +106,13 @@ pub fn setup_network() -> DummyNetwork {
     let mut rng = StdRng::from_seed(TEST_SEED);
     let dialer_signing_private_key = Ed25519PrivateKey::generate(&mut rng);
     let dialer_signing_public_key = dialer_signing_private_key.public_key();
-    let dialer_identity_private_key = x25519::PrivateKey::for_test(&mut rng);
+    let dialer_identity_private_key = x25519::PrivateKey::generate(&mut rng);
     let dialer_identity_public_key = dialer_identity_private_key.public_key();
 
     // Setup keys for listener.
     let listener_signing_private_key = Ed25519PrivateKey::generate(&mut rng);
     let listener_signing_public_key = listener_signing_private_key.public_key();
-    let listener_identity_private_key = x25519::PrivateKey::for_test(&mut rng);
+    let listener_identity_private_key = x25519::PrivateKey::generate(&mut rng);
     let listener_identity_public_key = listener_identity_private_key.public_key();
 
     // Setup trusted peers.
@@ -145,9 +145,10 @@ pub fn setup_network() -> DummyNetwork {
     network_builder
         .transport(TransportType::TcpNoise(Some(listener_identity_private_key)))
         .trusted_peers(trusted_peers.clone())
-        .signing_keys((listener_signing_private_key, listener_signing_public_key))
+        .signing_keypair((listener_signing_private_key, listener_signing_public_key))
         .discovery_interval_ms(HOUR_IN_MS)
-        .add_discovery();
+        .add_connectivity_manager()
+        .add_gossip_discovery();
     let (listener_sender, mut listener_events) = add_to_network(&mut network_builder);
     let listen_addr = network_builder.build();
 
@@ -161,7 +162,7 @@ pub fn setup_network() -> DummyNetwork {
     network_builder
         .transport(TransportType::TcpNoise(Some(dialer_identity_private_key)))
         .trusted_peers(trusted_peers)
-        .signing_keys((dialer_signing_private_key, dialer_signing_public_key))
+        .signing_keypair((dialer_signing_private_key, dialer_signing_public_key))
         .seed_peers(
             [(listener_peer_id, vec![listen_addr])]
                 .iter()
@@ -169,7 +170,8 @@ pub fn setup_network() -> DummyNetwork {
                 .collect(),
         )
         .discovery_interval_ms(HOUR_IN_MS)
-        .add_discovery();
+        .add_connectivity_manager()
+        .add_gossip_discovery();
     let (dialer_sender, mut dialer_events) = add_to_network(&mut network_builder);
     let _dialer_addr = network_builder.build();
 

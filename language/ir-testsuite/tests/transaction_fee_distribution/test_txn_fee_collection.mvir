@@ -1,6 +1,7 @@
 //! account: alice, 90000
 
 //! sender: alice
+//! gas-price: 1
 
 import 0x0.LibraAccount;
 import 0x0.LBR;
@@ -10,7 +11,8 @@ main() {
     let transaction_fee_pot_amount: u64;
     x = 10;
     // Make sure that the pot is empty to start with
-    transaction_fee_pot_amount = LibraAccount.balance<LBR.T>(0xFEE);
+    transaction_fee_pot_amount =
+    LibraAccount.balance<LBR.T>(0xFEE);
     assert(move(transaction_fee_pot_amount) == 0, 0);
     // Do some work
     while (copy(x) > 0) {

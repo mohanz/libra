@@ -18,14 +18,14 @@ use crate::{
 use channel::{libra_channel, message_queues::QueueStyle};
 use futures::{channel::oneshot, io::AsyncWriteExt, sink::SinkExt, stream::StreamExt};
 use libra_config::config::RoleType;
+use libra_network_address::NetworkAddress;
 use libra_types::PeerId;
 use memsocket::MemorySocket;
 use netcore::{
     compat::IoCompat,
     transport::{boxed::BoxedTransport, memory::MemoryTransport, ConnectionOrigin, TransportExt},
 };
-use parity_multiaddr::Multiaddr;
-use std::{collections::HashMap, iter::FromIterator, num::NonZeroUsize, str::FromStr};
+use std::{collections::HashMap, iter::FromIterator, num::NonZeroUsize};
 use tokio::runtime::Handle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -207,7 +207,7 @@ async fn check_correct_connection_is_live(
 fn create_connection<TSocket: transport::TSocket>(
     socket: TSocket,
     peer_id: PeerId,
-    addr: Multiaddr,
+    addr: NetworkAddress,
     origin: ConnectionOrigin,
     connection_id: ConnectionId,
 ) -> Connection<TSocket> {
@@ -242,7 +242,7 @@ fn peer_manager_simultaneous_dial_two_inbound() {
         peer_manager.add_peer(create_connection(
             inbound1,
             ids[0],
-            Multiaddr::from_str("/ip6/::1/tcp/8080").unwrap(),
+            "/ip6/::1/tcp/8080".parse().unwrap(),
             ConnectionOrigin::Inbound,
             ConnectionId::from(0),
         ));
@@ -251,7 +251,7 @@ fn peer_manager_simultaneous_dial_two_inbound() {
         peer_manager.add_peer(create_connection(
             inbound2,
             ids[0],
-            Multiaddr::from_str("/ip6/::1/tcp/8081").unwrap(),
+            "/ip6/::1/tcp/8081".parse().unwrap(),
             ConnectionOrigin::Inbound,
             ConnectionId::from(1),
         ));
@@ -290,7 +290,7 @@ fn peer_manager_simultaneous_dial_inbound_outbound_remote_id_larger() {
         peer_manager.add_peer(create_connection(
             inbound1,
             ids[1],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Inbound,
             ConnectionId::from(0),
         ));
@@ -299,7 +299,7 @@ fn peer_manager_simultaneous_dial_inbound_outbound_remote_id_larger() {
         peer_manager.add_peer(create_connection(
             outbound2,
             ids[1],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Outbound,
             ConnectionId::from(1),
         ));
@@ -339,7 +339,7 @@ fn peer_manager_simultaneous_dial_inbound_outbound_own_id_larger() {
         peer_manager.add_peer(create_connection(
             inbound1,
             ids[0],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Inbound,
             ConnectionId::from(0),
         ));
@@ -348,7 +348,7 @@ fn peer_manager_simultaneous_dial_inbound_outbound_own_id_larger() {
         peer_manager.add_peer(create_connection(
             outbound2,
             ids[0],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Outbound,
             ConnectionId::from(1),
         ));
@@ -388,7 +388,7 @@ fn peer_manager_simultaneous_dial_outbound_inbound_remote_id_larger() {
         peer_manager.add_peer(create_connection(
             outbound1,
             ids[1],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Outbound,
             ConnectionId::from(0),
         ));
@@ -397,7 +397,7 @@ fn peer_manager_simultaneous_dial_outbound_inbound_remote_id_larger() {
         peer_manager.add_peer(create_connection(
             inbound2,
             ids[1],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Inbound,
             ConnectionId::from(1),
         ));
@@ -437,7 +437,7 @@ fn peer_manager_simultaneous_dial_outbound_inbound_own_id_larger() {
         peer_manager.add_peer(create_connection(
             outbound1,
             ids[0],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Outbound,
             ConnectionId::from(0),
         ));
@@ -446,7 +446,7 @@ fn peer_manager_simultaneous_dial_outbound_inbound_own_id_larger() {
         peer_manager.add_peer(create_connection(
             inbound2,
             ids[0],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Inbound,
             ConnectionId::from(1),
         ));
@@ -486,7 +486,7 @@ fn peer_manager_simultaneous_dial_two_outbound() {
         peer_manager.add_peer(create_connection(
             outbound1,
             ids[0],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Outbound,
             ConnectionId::from(0),
         ));
@@ -495,7 +495,7 @@ fn peer_manager_simultaneous_dial_two_outbound() {
         peer_manager.add_peer(create_connection(
             outbound2,
             ids[0],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Outbound,
             ConnectionId::from(1),
         ));
@@ -528,7 +528,7 @@ fn peer_manager_simultaneous_dial_disconnect_event() {
         peer_manager.add_peer(create_connection(
             outbound,
             ids[0],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Outbound,
             ConnectionId::from(1),
         ));
@@ -540,7 +540,7 @@ fn peer_manager_simultaneous_dial_disconnect_event() {
             ConnectionMetadata::new(
                 ids[0],
                 ConnectionId::from(0),
-                Multiaddr::empty(),
+                NetworkAddress::mock(),
                 ConnectionOrigin::Inbound,
                 MessagingProtocolVersion::V1,
                 [TEST_PROTOCOL].iter().into(),
@@ -571,7 +571,7 @@ fn test_dial_disconnect() {
         peer_manager.add_peer(create_connection(
             outbound,
             ids[0],
-            Multiaddr::empty(),
+            NetworkAddress::mock(),
             ConnectionOrigin::Outbound,
             ConnectionId::from(0),
         ));
@@ -597,7 +597,7 @@ fn test_dial_disconnect() {
             ConnectionMetadata::new(
                 ids[0],
                 ConnectionId::from(0),
-                Multiaddr::empty(),
+                NetworkAddress::mock(),
                 ConnectionOrigin::Outbound,
                 MessagingProtocolVersion::V1,
                 [TEST_PROTOCOL].iter().into(),

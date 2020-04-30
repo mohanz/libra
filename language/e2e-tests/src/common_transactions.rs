@@ -44,7 +44,7 @@ pub fn create_account_txn(
 
     sender.create_signed_txn_with_args(
         StdlibScript::CreateAccount.compiled_bytes().into_vec(),
-        vec![],
+        vec![lbr_type_tag()],
         args,
         seq_num,
         gas_costs::TXN_RESERVED,
@@ -154,7 +154,7 @@ pub fn rotate_consensus_pubkey_txn(
         vec![],
         args,
         seq_num,
-        gas_costs::TXN_RESERVED,
+        gas_costs::TXN_RESERVED * 3,
         1,
     )
 }
@@ -174,7 +174,7 @@ pub fn mint_txn(
     // get a SignedTransaction
     sender.create_signed_txn_with_args(
         StdlibScript::Mint.compiled_bytes().into_vec(),
-        vec![],
+        vec![lbr_type_tag()],
         args,
         seq_num,
         gas_costs::TXN_RESERVED, // this is a default for gas

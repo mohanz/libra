@@ -7,7 +7,7 @@ use consensus_types::{
     timeout::Timeout, vote::Vote, vote_proposal::VoteProposal,
 };
 use libra_crypto::ed25519::Ed25519Signature;
-use libra_types::validator_change::ValidatorChangeProof;
+use libra_types::epoch_change::EpochChangeProof;
 use std::sync::{Arc, RwLock};
 
 /// A local interface into SafetyRules. Constructed in such a way that the container / caller
@@ -28,16 +28,12 @@ impl<T: Payload> TSafetyRules<T> for LocalClient<T> {
         self.internal.write().unwrap().consensus_state()
     }
 
-    fn initialize(&mut self, proof: &ValidatorChangeProof) -> Result<(), Error> {
+    fn initialize(&mut self, proof: &EpochChangeProof) -> Result<(), Error> {
         self.internal.write().unwrap().initialize(proof)
     }
 
     fn update(&mut self, qc: &QuorumCert) -> Result<(), Error> {
         self.internal.write().unwrap().update(qc)
-    }
-
-    fn start_new_epoch(&mut self, qc: &QuorumCert) -> Result<(), Error> {
-        self.internal.write().unwrap().start_new_epoch(qc)
     }
 
     fn construct_and_sign_vote(&mut self, vote_proposal: &VoteProposal<T>) -> Result<Vote, Error> {

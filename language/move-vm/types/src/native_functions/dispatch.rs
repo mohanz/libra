@@ -1,27 +1,30 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{hash, lcs, signature};
+use super::{lcs, signature};
 use crate::{
-    loaded_data::types::Type,
+    loaded_data::runtime_types::Type,
+    native_functions::{account, context::NativeContext, event, hash},
     values::{debug, vector, Value},
 };
 use libra_types::{
     account_address::AccountAddress,
-    account_config::{account_module_name, AccountResource, BalanceResource, CORE_CODE_ADDRESS},
+    account_config::{
+        account_type_module_name, account_type_struct_name, event_handle_generator_struct_name,
+        event_module_name, AccountResource, BalanceResource, CORE_CODE_ADDRESS,
+    },
     language_storage::ModuleId,
     move_resource::MoveResource,
     vm_error::{StatusCode, VMStatus},
 };
-use move_core_types::identifier::IdentStr;
+use move_core_types::gas_schedule::{
+    AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasUnits, NativeCostIndex,
+};
 use std::collections::VecDeque;
 use vm::{
     access::ModuleAccess,
     errors::VMResult,
     file_format::{FunctionSignature, Kind, Signature, SignatureToken, StructHandleIndex},
-    gas_schedule::{
-        AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasUnits, NativeCostIndex,
-    },
     views::ModuleView,
 };
 
@@ -87,15 +90,52 @@ pub enum NativeFunction {
     DebugPrintStackTrace,
 }
 
-impl NativeFunction {
-    pub fn resolve(module: &ModuleId, function_name: &IdentStr) -> Option<Self> {
+/// Function.
+pub trait Function: Copy {
+    /// Given the vector of aguments, it executes the native function.
+    fn dispatch(
+        self,
+        ctx: &mut impl NativeContext,
+        t: Vec<Type>,
+        v: VecDeque<Value>,
+    ) -> VMResult<NativeResult>;
+
+    /// The number of arguments to the native function,
+    /// It is checked at publishing of the module that this matches the expected signature.
+    fn num_args(&self) -> usize;
+
+    fn parameters<T: ModuleAccess>(self, m: Option<&ModuleView<T>>) -> VMResult<Option<Signature>>;
+
+    fn return_<T: ModuleAccess>(self, m: Option<&ModuleView<T>>) -> VMResult<Option<Signature>>;
+
+    fn type_parameters<T: ModuleAccess>(
+        self,
+        m: Option<&ModuleView<T>>,
+    ) -> VMResult<Option<Vec<Kind>>>;
+
+    /// The signature as defined in it's declaring module.
+    /// It should NOT be generally inspected outside of it's declaring module as the various
+    /// struct handle indexes are not remapped into the local context.
+    /// Returns:
+    /// - `Err(NATIVE_FUNCTION_INTERNAL_INCONSISTENCY)` if the produced function signature
+    ///   is inconsistent with `self.num_args()`. This only fails if the native function was
+    ///   implemented incorrectly
+    /// - `Ok(None)` if a function signature could not be generated for the native function with
+    ///   the given `ModuleView`, `m`
+    /// - `Ok(Some(expected_function_signature))` otherwise
+    fn signature<T: ModuleAccess>(
+        self,
+        m: Option<&ModuleView<T>>,
+    ) -> VMResult<Option<FunctionSignature>>;
+}
+
+pub struct FunctionResolver();
+
+impl FunctionResolver {
+    pub fn resolve(module: &ModuleId, function_name: &str) -> Option<impl Function> {
         use NativeFunction::*;
 
-        let case = (
-            module.address(),
-            module.name().as_str(),
-            function_name.as_str(),
-        );
+        let case = (module.address(), module.name().as_str(), function_name);
         Some(match case {
             (&CORE_CODE_ADDRESS, "Hash", "sha2_256") => HashSha2_256,
             (&CORE_CODE_ADDRESS, "Hash", "sha3_256") => HashSha3_256,
@@ -112,7 +152,7 @@ impl NativeFunction {
             (&CORE_CODE_ADDRESS, "Vector", "pop_back") => VectorPopBack,
             (&CORE_CODE_ADDRESS, "Vector", "destroy_empty") => VectorDestroyEmpty,
             (&CORE_CODE_ADDRESS, "Vector", "swap") => VectorSwap,
-            (&CORE_CODE_ADDRESS, "LibraAccount", "write_to_event_store") => AccountWriteEvent,
+            (&CORE_CODE_ADDRESS, "Event", "write_to_event_store") => AccountWriteEvent,
             (&CORE_CODE_ADDRESS, "LibraAccount", "save_account") => AccountSaveAccount,
             (&CORE_CODE_ADDRESS, "Debug", "print") => DebugPrint,
             (&CORE_CODE_ADDRESS, "Debug", "print_stack_trace") => DebugPrintStackTrace,
@@ -121,45 +161,40 @@ impl NativeFunction {
     }
 }
 
-impl NativeFunction {
+impl Function for NativeFunction {
     /// Given the vector of aguments, it executes the native function.
-    pub fn dispatch(
+    fn dispatch(
         self,
+        ctx: &mut impl NativeContext,
         t: Vec<Type>,
         v: VecDeque<Value>,
-        c: &CostTable,
     ) -> VMResult<NativeResult> {
         match self {
-            Self::HashSha2_256 => hash::native_sha2_256(t, v, c),
-            Self::HashSha3_256 => hash::native_sha3_256(t, v, c),
-            Self::LCSToBytes => lcs::native_to_bytes(t, v, c),
-            Self::SigED25519Verify => signature::native_ed25519_signature_verification(t, v, c),
+            Self::HashSha2_256 => hash::native_sha2_256(ctx, t, v),
+            Self::HashSha3_256 => hash::native_sha3_256(ctx, t, v),
+            Self::SigED25519Verify => signature::native_ed25519_signature_verification(ctx, t, v),
             Self::SigED25519ThresholdVerify => {
-                signature::native_ed25519_threshold_signature_verification(t, v, c)
+                signature::native_ed25519_threshold_signature_verification(ctx, t, v)
             }
-            Self::VectorLength => vector::native_length(t, v, c),
-            Self::VectorEmpty => vector::native_empty(t, v, c),
-            Self::VectorBorrow => vector::native_borrow(t, v, c),
-            Self::VectorBorrowMut => vector::native_borrow(t, v, c),
-            Self::VectorPushBack => vector::native_push_back(t, v, c),
-            Self::VectorPopBack => vector::native_pop(t, v, c),
-            Self::VectorDestroyEmpty => vector::native_destroy_empty(t, v, c),
-            Self::VectorSwap => vector::native_swap(t, v, c),
-            Self::AccountWriteEvent => Err(VMStatus::new(StatusCode::UNREACHABLE).with_message(
-                "write_to_event_store does not have a native implementation".to_string(),
-            )),
-            Self::AccountSaveAccount => Err(VMStatus::new(StatusCode::UNREACHABLE)
-                .with_message("save_account does not have a native implementation".to_string())),
-            Self::DebugPrint => debug::native_print(t, v, c),
-            Self::DebugPrintStackTrace => Err(VMStatus::new(StatusCode::UNREACHABLE).with_message(
-                "print_stack_trace does not have a native implementation".to_string(),
-            )),
+            Self::VectorLength => vector::native_length(ctx, t, v),
+            Self::VectorEmpty => vector::native_empty(ctx, t, v),
+            Self::VectorBorrow => vector::native_borrow(ctx, t, v),
+            Self::VectorBorrowMut => vector::native_borrow(ctx, t, v),
+            Self::VectorPushBack => vector::native_push_back(ctx, t, v),
+            Self::VectorPopBack => vector::native_pop(ctx, t, v),
+            Self::VectorDestroyEmpty => vector::native_destroy_empty(ctx, t, v),
+            Self::VectorSwap => vector::native_swap(ctx, t, v),
+            Self::AccountWriteEvent => event::native_emit_event(ctx, t, v),
+            Self::AccountSaveAccount => account::native_save_account(ctx, t, v),
+            Self::LCSToBytes => lcs::native_to_bytes(ctx, t, v),
+            Self::DebugPrint => debug::native_print(ctx, t, v),
+            Self::DebugPrintStackTrace => debug::native_print_stack_trace(ctx, t, v),
         }
     }
 
     /// The number of arguments to the native function,
     /// It is checked at publishing of the module that this matches the expected signature.
-    pub fn num_args(self) -> usize {
+    fn num_args(&self) -> usize {
         match self {
             Self::HashSha2_256 => 1,
             Self::HashSha3_256 => 1,
@@ -175,27 +210,21 @@ impl NativeFunction {
             Self::VectorDestroyEmpty => 1,
             Self::VectorSwap => 3,
             Self::AccountWriteEvent => 3,
-            Self::AccountSaveAccount => 3,
+            Self::AccountSaveAccount => 5,
             Self::DebugPrint => 1,
             Self::DebugPrintStackTrace => 0,
         }
     }
 
-    pub fn parameters<T: ModuleAccess>(
-        self,
-        m: Option<&ModuleView<T>>,
-    ) -> VMResult<Option<Signature>> {
+    fn parameters<T: ModuleAccess>(self, m: Option<&ModuleView<T>>) -> VMResult<Option<Signature>> {
         Ok(self.signature(m)?.map(|res| Signature(res.parameters)))
     }
 
-    pub fn return_<T: ModuleAccess>(
-        self,
-        m: Option<&ModuleView<T>>,
-    ) -> VMResult<Option<Signature>> {
+    fn return_<T: ModuleAccess>(self, m: Option<&ModuleView<T>>) -> VMResult<Option<Signature>> {
         Ok(self.signature(m)?.map(|res| Signature(res.return_)))
     }
 
-    pub fn type_parameters<T: ModuleAccess>(
+    fn type_parameters<T: ModuleAccess>(
         self,
         m: Option<&ModuleView<T>>,
     ) -> VMResult<Option<Vec<Kind>>> {
@@ -212,7 +241,7 @@ impl NativeFunction {
     /// - `Ok(None)` if a function signature could not be generated for the native function with
     ///   the given `ModuleView`, `m`
     /// - `Ok(Some(expected_function_signature))` otherwise
-    pub fn signature<T: ModuleAccess>(
+    fn signature<T: ModuleAccess>(
         self,
         m: Option<&ModuleView<T>>,
     ) -> VMResult<Option<FunctionSignature>> {
@@ -232,7 +261,9 @@ impl NativeFunction {
             )
         }
     }
+}
 
+impl NativeFunction {
     fn signature_<T: ModuleAccess>(self, m: Option<&ModuleView<T>>) -> Option<FunctionSignature> {
         use SignatureToken::*;
         macro_rules! simple {
@@ -335,22 +366,36 @@ impl NativeFunction {
                 vec![]
             ),
             Self::AccountSaveAccount => {
-                let type_parameters = vec![Kind::All];
+                let type_parameters = vec![Kind::All, Kind::Copyable];
                 let self_t_idx = struct_handle_idx(
                     m?,
                     &CORE_CODE_ADDRESS,
-                    account_module_name().as_str(),
+                    AccountResource::MODULE_NAME,
                     AccountResource::STRUCT_NAME,
                 )?;
                 let balance_t_idx = struct_handle_idx(
                     m?,
                     &CORE_CODE_ADDRESS,
-                    account_module_name().as_str(),
+                    AccountResource::MODULE_NAME,
                     BalanceResource::STRUCT_NAME,
                 )?;
+                let assoc_cap_t_idx = struct_handle_idx(
+                    m?,
+                    &CORE_CODE_ADDRESS,
+                    account_type_module_name().as_str(),
+                    account_type_struct_name().as_str(),
+                )?;
+                let event_generator_t_idx = struct_handle_idx(
+                    m?,
+                    &CORE_CODE_ADDRESS,
+                    event_module_name().as_str(),
+                    event_handle_generator_struct_name().as_str(),
+                )?;
                 let parameters = vec![
+                    StructInstantiation(assoc_cap_t_idx, vec![TypeParameter(1)]),
                     StructInstantiation(balance_t_idx, vec![TypeParameter(0)]),
                     Struct(self_t_idx),
+                    Struct(event_generator_t_idx),
                     Address,
                 ];
                 let return_ = vec![];

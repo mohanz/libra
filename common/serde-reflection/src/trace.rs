@@ -21,8 +21,8 @@ pub type RegistryOwned = BTreeMap<String, ContainerFormat>;
 /// This typically aims at computing a `Registry`.
 #[derive(Debug)]
 pub struct Tracer {
-    /// Whether to trace the human readable variant of the (De)Serialize traits.
-    pub(crate) is_human_readable: bool,
+    /// Hold configuration options.
+    pub(crate) config: TracerConfig,
 
     /// Formats of the named containers discovered so far, while tracing
     /// serialization and/or deserialization.
@@ -33,30 +33,78 @@ pub struct Tracer {
     pub(crate) incomplete_enums: BTreeSet<String>,
 }
 
-/// Value samples recorded during serialization.
+/// User inputs, aka "samples", recorded during serialization.
 /// This will help passing user-defined checks during deserialization.
 #[derive(Debug, Default)]
-pub struct SerializationRecords {
+pub struct Samples {
     pub(crate) values: BTreeMap<&'static str, Value>,
 }
 
-impl SerializationRecords {
+impl Samples {
+    /// Create a new structure to hold value samples.
     pub fn new() -> Self {
-        Self {
-            values: BTreeMap::new(),
-        }
+        Self::default()
     }
 
+    /// Obtain a (serialized) sample.
     pub fn value(&self, name: &'static str) -> Option<&Value> {
         self.values.get(name)
     }
 }
 
+/// Configuration object to create a tracer.
+#[derive(Debug)]
+pub struct TracerConfig {
+    pub(crate) is_human_readable: bool,
+    pub(crate) record_samples_for_newtype_structs: bool,
+    pub(crate) record_samples_for_tuple_structs: bool,
+    pub(crate) record_samples_for_structs: bool,
+}
+
+impl Default for TracerConfig {
+    /// Create a new structure to hold value samples.
+    fn default() -> Self {
+        Self {
+            is_human_readable: false,
+            record_samples_for_newtype_structs: true,
+            record_samples_for_tuple_structs: false,
+            record_samples_for_structs: false,
+        }
+    }
+}
+
+impl TracerConfig {
+    /// Whether to trace the human readable encoding of (de)serialization.
+    #[allow(clippy::wrong_self_convention)]
+    pub fn is_human_readable(mut self, value: bool) -> Self {
+        self.is_human_readable = value;
+        self
+    }
+
+    /// Record samples of newtype structs during serialization and inject them during deserialization.
+    pub fn record_samples_for_newtype_structs(mut self, value: bool) -> Self {
+        self.record_samples_for_newtype_structs = value;
+        self
+    }
+
+    /// Record samples of tuple structs during serialization and inject them during deserialization.
+    pub fn record_samples_for_tuple_structs(mut self, value: bool) -> Self {
+        self.record_samples_for_tuple_structs = value;
+        self
+    }
+
+    /// Record samples of (regular) structs during serialization and inject them during deserialization.
+    pub fn record_samples_for_structs(mut self, value: bool) -> Self {
+        self.record_samples_for_structs = value;
+        self
+    }
+}
+
 impl Tracer {
     /// Start tracing deserialization.
-    pub fn new(is_human_readable: bool) -> Self {
+    pub fn new(config: TracerConfig) -> Self {
         Self {
-            is_human_readable,
+            config,
             registry: BTreeMap::new(),
             incomplete_enums: BTreeSet::new(),
         }
@@ -65,17 +113,13 @@ impl Tracer {
     /// Trace the serialization of a particular value.
     /// * Nested containers will be added to the tracing registry, indexed by
     /// their (non-qualified) name.
-    /// * Sampled Rust values will be inserted into `records` to benefit future calls
+    /// * Sampled Rust values will be inserted into `samples` to benefit future calls
     /// to the `trace_type_*` methods.
-    pub fn trace_value<T>(
-        &mut self,
-        records: &mut SerializationRecords,
-        value: &T,
-    ) -> Result<(Format, Value)>
+    pub fn trace_value<T>(&mut self, samples: &mut Samples, value: &T) -> Result<(Format, Value)>
     where
         T: ?Sized + Serialize,
     {
-        let serializer = Serializer::new(self, records);
+        let serializer = Serializer::new(self, samples);
         value.serialize(serializer)
     }
 
@@ -85,17 +129,14 @@ impl Tracer {
     /// * As a byproduct of deserialization, we also return a value of type `T`.
     /// * Tracing deserialization of a type may fail if this type or some dependencies
     /// have implemented a custom deserializer that validates data. The solution is
-    /// to make sure that `records` holds enough sampled Rust values to cover all the
+    /// to make sure that `samples` holds enough sampled Rust values to cover all the
     /// custom types.
-    pub fn trace_type_once<'de, T>(
-        &mut self,
-        records: &'de SerializationRecords,
-    ) -> Result<(Format, T)>
+    pub fn trace_type_once<'de, T>(&mut self, samples: &'de Samples) -> Result<(Format, T)>
     where
         T: Deserialize<'de>,
     {
         let mut format = Format::Unknown;
-        let deserializer = Deserializer::new(self, records, &mut format);
+        let deserializer = Deserializer::new(self, samples, &mut format);
         let value = T::deserialize(deserializer)?;
         Ok((format, value))
     }
@@ -103,14 +144,14 @@ impl Tracer {
     /// Same as `trace_type_once` for seeded deserialization.
     pub fn trace_type_once_with_seed<'de, S>(
         &mut self,
-        records: &'de SerializationRecords,
+        samples: &'de Samples,
         seed: S,
     ) -> Result<(Format, S::Value)>
     where
         S: DeserializeSeed<'de>,
     {
         let mut format = Format::Unknown;
-        let deserializer = Deserializer::new(self, records, &mut format);
+        let deserializer = Deserializer::new(self, samples, &mut format);
         let value = seed.deserialize(deserializer)?;
         Ok((format, value))
     }
@@ -118,16 +159,13 @@ impl Tracer {
     /// Same as `trace_type_once` but if `T` is an enum, we repeat the process
     /// until all variants of `T` are covered.
     /// We accumulate and return all the sampled values at the end.
-    pub fn trace_type<'de, T>(
-        &mut self,
-        records: &'de SerializationRecords,
-    ) -> Result<(Format, Vec<T>)>
+    pub fn trace_type<'de, T>(&mut self, samples: &'de Samples) -> Result<(Format, Vec<T>)>
     where
         T: Deserialize<'de>,
     {
         let mut values = Vec::new();
         loop {
-            let (format, value) = self.trace_type_once::<T>(records)?;
+            let (format, value) = self.trace_type_once::<T>(samples)?;
             values.push(value);
             if let Format::TypeName(name) = &format {
                 if self.incomplete_enums.contains(name) {
@@ -143,7 +181,7 @@ impl Tracer {
     /// Same as `trace_type` for seeded deserialization.
     pub fn trace_type_with_seed<'de, S>(
         &mut self,
-        records: &'de SerializationRecords,
+        samples: &'de Samples,
         seed: S,
     ) -> Result<(Format, Vec<S::Value>)>
     where
@@ -151,7 +189,7 @@ impl Tracer {
     {
         let mut values = Vec::new();
         loop {
-            let (format, value) = self.trace_type_once_with_seed(records, seed.clone())?;
+            let (format, value) = self.trace_type_once_with_seed(samples, seed.clone())?;
             values.push(value);
             if let Format::TypeName(name) = &format {
                 if self.incomplete_enums.contains(name) {
@@ -198,19 +236,22 @@ impl Tracer {
 
     pub(crate) fn record_container(
         &mut self,
-        records: &mut SerializationRecords,
+        samples: &mut Samples,
         name: &'static str,
         format: ContainerFormat,
         value: Value,
+        record_value: bool,
     ) -> Result<(Format, Value)> {
         self.registry.entry(name).unify(format)?;
-        records.values.insert(name, value.clone());
+        if record_value {
+            samples.values.insert(name, value.clone());
+        }
         Ok((Format::TypeName(name.into()), value))
     }
 
     pub(crate) fn record_variant(
         &mut self,
-        records: &mut SerializationRecords,
+        samples: &mut Samples,
         name: &'static str,
         variant_index: u32,
         variant_name: &'static str,
@@ -227,15 +268,15 @@ impl Tracer {
         );
         let format = ContainerFormat::Enum(variants);
         let value = Value::Variant(variant_index, Box::new(variant_value));
-        self.record_container(records, name, format, value)
+        self.record_container(samples, name, format, value, false)
     }
 
-    pub(crate) fn get_recorded_value<'de, 'a>(
+    pub(crate) fn get_sample<'de, 'a>(
         &'a self,
-        records: &'de SerializationRecords,
+        samples: &'de Samples,
         name: &'static str,
     ) -> Option<(&'a ContainerFormat, &'de Value)> {
-        match records.value(name) {
+        match samples.value(name) {
             Some(value) => {
                 let format = self
                     .registry

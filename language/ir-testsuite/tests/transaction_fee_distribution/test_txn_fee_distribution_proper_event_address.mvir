@@ -19,7 +19,7 @@ main() {
   assert(copy(number_of_validators) > 1, 0);
   lib_coin = LibraAccount.withdraw_from_sender<LBR.T>(copy(number_of_validators));
 
-  LibraAccount.deposit<LBR.T>({{fees}} , move(lib_coin));
+  LibraAccount.deposit<LBR.T>(0xFEE, move(lib_coin));
 
   return;
 }

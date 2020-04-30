@@ -19,7 +19,7 @@ use stackless_bytecode_generator::{
     function_target_pipeline::FunctionTargetsHolder,
     lifetime_analysis::LifetimeAnnotation,
     stackless_bytecode::{
-        AssignKind, BranchCond,
+        AssignKind,
         Bytecode::{self, *},
         Constant, Operation, SpecBlockId,
     },
@@ -32,10 +32,11 @@ use crate::{
         boogie_struct_name, boogie_struct_type_value, boogie_type_value, boogie_type_values,
         boogie_var_before_borrow, boogie_well_formed_check, WellFormedMode,
     },
-    cli::Options,
+    cli::{Options, VerificationScope},
     code_writer::CodeWriter,
     spec_translator::SpecTranslator,
 };
+use spec_lang::ast::Value;
 
 pub struct BoogieTranslator<'env> {
     env: &'env GlobalEnv,
@@ -196,6 +197,10 @@ impl<'env> ModuleTranslator<'env> {
             .enumerate()
             .map(|(i, _)| format!("$tv{}: TypeValue", i))
             .join(", ");
+        let mut type_args_for_ctor = String::from("EmptyTypeValueArray");
+        for i in 0..struct_env.get_type_parameters().len() {
+            type_args_for_ctor = format!("ExtendTypeValueArray({}, $tv{})", type_args_for_ctor, i);
+        }
         let mut field_types = String::from("EmptyTypeValueArray");
         for field_env in struct_env.get_fields() {
             field_types = format!(
@@ -204,14 +209,25 @@ impl<'env> ModuleTranslator<'env> {
                 boogie_type_value(self.module_env.env, &field_env.get_type())
             );
         }
-        let type_value = format!("StructType({}, {})", struct_name, field_types);
-        if struct_name == "LibraAccount_T" {
+        let type_value = format!(
+            "StructType({}, {}, {})",
+            struct_name, type_args_for_ctor, field_types
+        );
+        if struct_name == "$LibraAccount_T" {
             // Special treatment of well-known resource LibraAccount_T. The type_value
-            // function is forward-declared in the prelude, here we only add an axiom for
-            // it.
+            // function is forward-declared in the prelude, here we only add an axiom for it.
             emitln!(
                 self.writer,
                 "axiom {}_type_value() == {};",
+                struct_name,
+                type_value
+            );
+        } else if struct_name == "$LibraAccount_Balance" {
+            // Special treatment of well-known resource LibraAccount_Balance. The type_value
+            // function is forward-declared in the prelude, here we only add an axiom for it.
+            emitln!(
+                self.writer,
+                "axiom (forall $tv0: TypeValue :: {}_type_value($tv0) == {});",
                 struct_name,
                 type_value
             );
@@ -253,7 +269,7 @@ impl<'env> ModuleTranslator<'env> {
             self.writer,
             "procedure {{:inline 1}} {}_pack($file_id: int, $byte_index: int, $var_idx: int, {}) returns ($struct: Value)\n{{",
             boogie_struct_name(struct_env),
-            separate(vec![type_args_str, args_str.clone()], ", ")
+            separate(vec![type_args_str.clone(), args_str.clone()], ", ")
         );
         self.writer.indent();
         let mut fields_str = String::from("EmptyValueArray");
@@ -290,8 +306,9 @@ impl<'env> ModuleTranslator<'env> {
         // Unpack function
         emitln!(
             self.writer,
-            "procedure {{:inline 1}} {}_unpack($struct: Value) returns ({})\n{{",
+            "procedure {{:inline 1}} {}_unpack({}) returns ({})\n{{",
             boogie_struct_name(struct_env),
+            separate(vec![type_args_str, "$struct: Value".to_string()], ", "),
             args_str
         );
         self.writer.indent();
@@ -335,7 +352,7 @@ impl<'env> ModuleTranslator<'env> {
             if !func_env.is_native() {
                 num_fun += 1;
             }
-            if !func_env.get_specification_on_decl().is_empty() && !func_env.is_native() {
+            if !func_env.get_spec().has_conditions() && !func_env.is_native() {
                 num_fun_specified += 1;
             }
             self.writer.set_location(&func_env.get_loc());
@@ -373,9 +390,8 @@ impl<'env> ModuleTranslator<'env> {
         self.generate_inline_function_body(func_target);
         emitln!(self.writer);
 
-        // If the function has no associated spec when the `only-verify-spec` flag is set,
-        // the `_verify` version is not generated to skip verifying the function without spec.
-        if self.options.only_verify_spec && func_target.get_specification_on_decl().is_empty() {
+        // If the function should not have a `_verify` entry point, stop here.
+        if !self.should_generate_verify(func_target) {
             return;
         }
 
@@ -383,6 +399,35 @@ impl<'env> ModuleTranslator<'env> {
         // verification.
         self.generate_function_sig(func_target, false); // no inline
         self.generate_verify_function_body(func_target); // function body just calls inlined version
+    }
+
+    /// Determines whether we should generate the `_verify` entry point for a function, which
+    /// triggers its standalone verification.
+    fn should_generate_verify(&self, func_target: &FunctionTarget<'_>) -> bool {
+        if func_target.func_env.module_env.is_in_dependency() {
+            // Never generate verify method for functions from dependencies.
+            return false;
+        }
+        // We look up the `verify` pragma property first in this function, then in
+        // the module, and finally fall back to the value of option `--verify`.
+        let prop_name = &func_target.symbol_pool().make("verify");
+        if let Some(Value::Bool(b)) = func_target.func_env.get_spec().properties.get(prop_name) {
+            return *b;
+        }
+        if let Some(Value::Bool(b)) = func_target
+            .func_env
+            .module_env
+            .get_spec()
+            .properties
+            .get(prop_name)
+        {
+            return *b;
+        }
+        match self.options.verify_scope {
+            VerificationScope::Public => func_target.func_env.is_public(),
+            VerificationScope::All => true,
+            VerificationScope::None => false,
+        }
     }
 
     /// Return a string for a boogie procedure header.
@@ -444,8 +489,7 @@ impl<'env> ModuleTranslator<'env> {
     /// Emit code for the function specification.
     fn generate_function_spec(&self, func_target: &FunctionTarget<'_>) {
         emitln!(self.writer);
-        SpecTranslator::new(self.writer, &func_target.func_env.module_env, true)
-            .translate_conditions(func_target);
+        SpecTranslator::new_for_spec_in_impl(self.writer, func_target, true).translate_conditions();
     }
 
     /// Emit code for spec inside function implementation.
@@ -455,7 +499,7 @@ impl<'env> ModuleTranslator<'env> {
         block_id: SpecBlockId,
     ) {
         SpecTranslator::new_for_spec_in_impl(self.writer, func_target, true)
-            .translate_conditions_inside_impl(func_target, block_id);
+            .translate_conditions_inside_impl(block_id);
     }
 
     /// Return string for body of verify function, which is just a call to the
@@ -472,9 +516,8 @@ impl<'env> ModuleTranslator<'env> {
         emitln!(self.writer, "call $InitVerification();");
 
         // (b) assume implicit preconditions.
-        let spec_translator =
-            SpecTranslator::new(self.writer, &func_target.func_env.module_env, false);
-        spec_translator.assume_preconditions(func_target);
+        let spec_translator = SpecTranslator::new_for_spec_in_impl(self.writer, func_target, false);
+        spec_translator.assume_preconditions();
 
         // (c) assume reference parameters to be based on the Param(i) Location, ensuring
         // they are disjoint from all other references. This prevents aliasing and is justified as
@@ -648,7 +691,7 @@ impl<'env> ModuleTranslator<'env> {
         }
 
         emitln!(self.writer, "\n// initialize function execution");
-        emitln!(self.writer, "assume !$abort_flag;");
+        emitln!(self.writer, "assert !$abort_flag;");
         emitln!(self.writer, "$saved_m := $m;");
         emitln!(self.writer, "$frame := $local_counter;");
 
@@ -741,7 +784,7 @@ impl<'env> ModuleTranslator<'env> {
         // Set location of this code in the CodeWriter.
         let loc = func_target.get_bytecode_loc(bytecode.get_attr_id());
         self.writer.set_location(&loc);
-        emitln!(self.writer, "// {:?}", bytecode); // DEBUG
+        emitln!(self.writer, "// {}", bytecode.display(func_target));
 
         // A boolean indicating whether we have evaluated invariants for refs going out of scope.
         let mut invariants_evaluated = false;
@@ -829,38 +872,29 @@ impl<'env> ModuleTranslator<'env> {
                 emitln!(self.writer, "L{}:", label.as_usize());
                 self.writer.indent();
             }
-            Branch(_, target, BranchCond::Always) => {
+            Jump(_, target) => {
                 // In contrast to other instructions, we need to evaluate invariants BEFORE
                 // the branch.
                 self.enforce_invariants_for_dead_refs(func_target, ctx, offset);
                 invariants_evaluated = true;
                 emitln!(self.writer, "goto L{};", target.as_usize())
             }
-            Branch(_, target, BranchCond::True(idx)) => {
+            Branch(_, then_target, else_target, idx) => {
                 self.enforce_invariants_for_dead_refs(func_target, ctx, offset);
                 invariants_evaluated = true;
                 emitln!(
                     self.writer,
-                    "$tmp := $GetLocal($m, $frame + {});\nif (b#Boolean($tmp)) {{ goto L{}; }}",
+                    "$tmp := $GetLocal($m, $frame + {});\nif (b#Boolean($tmp)) {{ goto L{}; }} else {{ goto L{}; }}",
                     idx,
-                    target.as_usize()
-                )
-            }
-            Branch(_, target, BranchCond::False(idx)) => {
-                self.enforce_invariants_for_dead_refs(func_target, ctx, offset);
-                invariants_evaluated = true;
-                emitln!(
-                    self.writer,
-                    "$tmp := $GetLocal($m, $frame + {});\nif (!b#Boolean($tmp)) {{ goto L{}; }}",
-                    idx,
-                    target.as_usize()
+                    then_target.as_usize(),
+                    else_target.as_usize(),
                 )
             }
             Assign(_, dest, src, _) => {
                 if func_target.get_local_type(*dest).is_reference() {
                     emitln!(
                         self.writer,
-                        "call {} := CopyOrMoveRef({});",
+                        "call {} := $CopyOrMoveRef({});",
                         str_local(*dest),
                         str_local(*src)
                     );
@@ -871,7 +905,7 @@ impl<'env> ModuleTranslator<'env> {
                 } else {
                     emitln!(
                         self.writer,
-                        "call $tmp := CopyOrMoveValue($GetLocal($m, $frame + {}));",
+                        "call $tmp := $CopyOrMoveValue($GetLocal($m, $frame + {}));",
                         src
                     );
                     emitln!(self.writer, &update_and_track_local(*dest, "$tmp"));
@@ -915,7 +949,7 @@ impl<'env> ModuleTranslator<'env> {
                         let dest = dests[0];
                         emitln!(
                             self.writer,
-                            "call {} := BorrowLoc($frame + {});",
+                            "call {} := $BorrowLoc($frame + {});",
                             str_local(dest),
                             src,
                         );
@@ -934,7 +968,7 @@ impl<'env> ModuleTranslator<'env> {
                     ReadRef => {
                         let src = srcs[0];
                         let dest = dests[0];
-                        emitln!(self.writer, "call $tmp := ReadRef({});", str_local(src));
+                        emitln!(self.writer, "call $tmp := $ReadRef({});", str_local(src));
                         emit!(
                             self.writer,
                             &boogie_well_formed_check(
@@ -947,13 +981,13 @@ impl<'env> ModuleTranslator<'env> {
                         emitln!(self.writer, &update_and_track_local(dest, "$tmp"));
                     }
                     WriteRef => {
-                        let src = srcs[0];
-                        let dest = dests[0];
+                        let reference = srcs[0];
+                        let value = srcs[1];
                         emitln!(
                             self.writer,
-                            "call WriteRef({}, $GetLocal($m, $frame + {}));",
-                            str_local(dest),
-                            src,
+                            "call $WriteRef({}, $GetLocal($m, $frame + {}));",
+                            str_local(reference),
+                            value,
                         );
                         track_mutable_refs(ctx);
                     }
@@ -962,7 +996,7 @@ impl<'env> ModuleTranslator<'env> {
                         let dest = dests[0];
                         emitln!(
                             self.writer,
-                            "call {} := FreezeRef({});",
+                            "call {} := $FreezeRef({});",
                             str_local(dest),
                             str_local(src),
                         )
@@ -974,12 +1008,13 @@ impl<'env> ModuleTranslator<'env> {
                         // code outside of the module is executed.
                         if callee_env.module_env.get_id()
                             != func_target.func_env.module_env.get_id()
-                            && !callee_env.module_env.get_module_invariants().is_empty()
+                            && callee_env.module_env.get_spec().has_conditions()
                         {
                             let spec_translator =
-                                SpecTranslator::new(self.writer, &callee_env.module_env, false);
+                                SpecTranslator::new(self.writer, &callee_env.module_env, false)
+                                    .set_type_args(type_actuals.clone());
                             spec_translator
-                                .assume_module_invariants(&self.targets.get_target(&callee_env));
+                                .assume_module_preconditions(&self.targets.get_target(&callee_env));
                         }
                         // If this is a call to a public function within the same module,
                         // and it has parameters which are mutated currently, we end mutating now,
@@ -1142,7 +1177,7 @@ impl<'env> ModuleTranslator<'env> {
                         emitln!(self.writer, &update_and_track_local(dest, "$tmp"));
                     }
 
-                    Unpack(mid, sid, _) => {
+                    Unpack(mid, sid, type_actuals) => {
                         let src = srcs[0];
                         let struct_env = func_target
                             .func_env
@@ -1165,12 +1200,17 @@ impl<'env> ModuleTranslator<'env> {
                                 tmp_assignments.push(track_local(*dest, &dest_str));
                             }
                         }
+                        let args_str = type_actuals
+                            .iter()
+                            .map(|s| boogie_type_value(self.module_env.env, s))
+                            .chain(vec![format!("$GetLocal($m, $frame + {})", src)])
+                            .join(", ");
                         emitln!(
                             self.writer,
-                            "call {} := {}_unpack($GetLocal($m, $frame + {}));",
+                            "call {} := {}_unpack({});",
                             dests_str,
                             boogie_struct_name(&struct_env),
-                            src,
+                            args_str,
                         );
                         for s in &tmp_assignments {
                             emitln!(self.writer, s);
@@ -1188,7 +1228,7 @@ impl<'env> ModuleTranslator<'env> {
                         let field_env = &struct_env.get_field_by_offset(*field_offset);
                         emitln!(
                             self.writer,
-                            "call {} := BorrowField({}, {});",
+                            "call {} := $BorrowField({}, {});",
                             str_local(dest),
                             str_local(src),
                             boogie_field_name(field_env)
@@ -1203,6 +1243,42 @@ impl<'env> ModuleTranslator<'env> {
                             )
                         );
                     }
+                    GetField(mid, sid, _, field_offset) => {
+                        let src = srcs[0];
+                        let dest = dests[0];
+                        let struct_env = func_target
+                            .func_env
+                            .module_env
+                            .env
+                            .get_module(*mid)
+                            .into_struct(*sid);
+                        let field_env = &struct_env.get_field_by_offset(*field_offset);
+                        if func_target.get_local_type(src).is_reference() {
+                            emitln!(
+                                self.writer,
+                                "call $tmp := $GetFieldFromReference({}, {});",
+                                str_local(src),
+                                boogie_field_name(field_env)
+                            );
+                        } else {
+                            emitln!(
+                                self.writer,
+                                "call $tmp := $GetFieldFromValue($GetLocal($m, $frame + {}), {});",
+                                src,
+                                boogie_field_name(field_env)
+                            );
+                        }
+                        emit!(
+                            self.writer,
+                            &boogie_well_formed_check(
+                                self.module_env.env,
+                                "$tmp",
+                                &func_target.get_local_type(dest),
+                                WellFormedMode::Default
+                            )
+                        );
+                        emitln!(self.writer, &update_and_track_local(dest, "$tmp"));
+                    }
                     Exists(mid, sid, type_actuals) => {
                         let addr = srcs[0];
                         let dest = dests[0];
@@ -1210,7 +1286,7 @@ impl<'env> ModuleTranslator<'env> {
                             boogie_struct_type_value(self.module_env.env, *mid, *sid, type_actuals);
                         emitln!(
                             self.writer,
-                            "call $tmp := Exists($GetLocal($m, $frame + {}), {});",
+                            "call $tmp := $Exists($GetLocal($m, $frame + {}), {});",
                             addr,
                             resource_type
                         );
@@ -1223,11 +1299,12 @@ impl<'env> ModuleTranslator<'env> {
                             boogie_struct_type_value(self.module_env.env, *mid, *sid, type_actuals);
                         emitln!(
                             self.writer,
-                            "call {} := BorrowGlobal($GetLocal($m, $frame + {}), {});",
+                            "call {} := $BorrowGlobal($GetLocal($m, $frame + {}), {});",
                             str_local(dest),
                             addr,
                             resource_type,
                         );
+                        emitln!(self.writer, &propagate_abort());
                         emit!(
                             self.writer,
                             &boogie_well_formed_check(
@@ -1238,8 +1315,31 @@ impl<'env> ModuleTranslator<'env> {
                                 WellFormedMode::WithInvariant,
                             )
                         );
-                        emitln!(self.writer, &propagate_abort());
                         save_borrowed_value(ctx, dest);
+                    }
+                    GetGlobal(mid, sid, type_actuals) => {
+                        let addr = srcs[0];
+                        let dest = dests[0];
+                        let resource_type =
+                            boogie_struct_type_value(self.module_env.env, *mid, *sid, type_actuals);
+                        emitln!(
+                            self.writer,
+                            "call $tmp := $GetGlobal($GetLocal($m, $frame + {}), {});",
+                            addr,
+                            resource_type,
+                        );
+                        emitln!(self.writer, &propagate_abort());
+                        emit!(
+                            self.writer,
+                            &boogie_well_formed_check(
+                                self.module_env.env,
+                                "$tmp",
+                                &func_target.get_local_type(dest),
+                                // At the beginning of a borrow, invariants always hold
+                                WellFormedMode::WithInvariant,
+                            )
+                        );
+                        emitln!(self.writer, &update_and_track_local(dest, "$tmp"));
                     }
                     MoveToSender(mid, sid, type_actuals) => {
                         let src = srcs[0];
@@ -1247,7 +1347,7 @@ impl<'env> ModuleTranslator<'env> {
                             boogie_struct_type_value(self.module_env.env, *mid, *sid, type_actuals);
                         emitln!(
                             self.writer,
-                            "call MoveToSender({}, $GetLocal($m, $frame + {}));",
+                            "call $MoveToSender({}, $GetLocal($m, $frame + {}));",
                             resource_type,
                             src,
                         );
@@ -1260,28 +1360,28 @@ impl<'env> ModuleTranslator<'env> {
                             boogie_struct_type_value(self.module_env.env, *mid, *sid, type_actuals);
                         emitln!(
                             self.writer,
-                            "call $tmp := MoveFrom($GetLocal($m, $frame + {}), {});",
+                            "call $tmp := $MoveFrom($GetLocal($m, $frame + {}), {});",
                             src,
                             resource_type,
                         );
-                        emitln!(self.writer, &update_and_track_local(dest, "$tmp"));
+                        emitln!(self.writer, &propagate_abort());
                         emit!(
                             self.writer,
                             &boogie_well_formed_check(
                                 self.module_env.env,
-                                str_local(dest).as_str(),
+                                "$tmp",
                                 &func_target.get_local_type(dest),
                                 WellFormedMode::Default
                             )
                         );
-                        emitln!(self.writer, &propagate_abort());
+                        emitln!(self.writer, &update_and_track_local(dest, "$tmp"));
                     }
                     CastU8 => {
                         let src = srcs[0];
                         let dest = dests[0];
                         emitln!(
                             self.writer,
-                            "call $tmp := CastU8($GetLocal($m, $frame + {}));",
+                            "call $tmp := $CastU8($GetLocal($m, $frame + {}));",
                             src
                         );
                         emitln!(self.writer, &propagate_abort());
@@ -1292,7 +1392,7 @@ impl<'env> ModuleTranslator<'env> {
                         let dest = dests[0];
                         emitln!(
                             self.writer,
-                            "call $tmp := CastU64($GetLocal($m, $frame + {}));",
+                            "call $tmp := $CastU64($GetLocal($m, $frame + {}));",
                             src
                         );
                         emitln!(self.writer, &propagate_abort());
@@ -1303,7 +1403,7 @@ impl<'env> ModuleTranslator<'env> {
                         let dest = dests[0];
                         emitln!(
                             self.writer,
-                            "call $tmp := CastU128($GetLocal($m, $frame + {}));",
+                            "call $tmp := $CastU128($GetLocal($m, $frame + {}));",
                             src
                         );
                         emitln!(self.writer, &propagate_abort());
@@ -1314,7 +1414,7 @@ impl<'env> ModuleTranslator<'env> {
                         let dest = dests[0];
                         emitln!(
                             self.writer,
-                            "call $tmp := Not($GetLocal($m, $frame + {}));",
+                            "call $tmp := $Not($GetLocal($m, $frame + {}));",
                             src
                         );
                         emitln!(self.writer, &update_and_track_local(dest, "$tmp"));
@@ -1331,7 +1431,7 @@ impl<'env> ModuleTranslator<'env> {
                         };
                         emitln!(
                             self.writer,
-                            "call $tmp := Add{}($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Add{}($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             add_type, op1, op2
                         );
                         emitln!(self.writer, &propagate_abort());
@@ -1343,7 +1443,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                            self.writer,
-                           "call $tmp := Sub($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                           "call $tmp := $Sub($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                            op1,
                            op2
                         );
@@ -1362,7 +1462,7 @@ impl<'env> ModuleTranslator<'env> {
                         };
                         emitln!(
                             self.writer,
-                            "call $tmp := Mul{}($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Mul{}($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             mul_type,
                             op1,
                             op2
@@ -1376,7 +1476,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                             self.writer,
-                            "call $tmp := Div($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Div($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1389,7 +1489,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                             self.writer,
-                            "call $tmp := Mod($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Mod($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1402,7 +1502,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                             self.writer,
-                            "call $tmp := Shl($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Shl($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1414,7 +1514,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                             self.writer,
-                            "call $tmp := Shr($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Shr($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1426,7 +1526,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                             self.writer,
-                            "call $tmp := Lt($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Lt($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1438,7 +1538,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                             self.writer,
-                            "call $tmp := Gt($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Gt($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1450,7 +1550,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                         self.writer,
-                            "call $tmp := Le($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Le($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1462,7 +1562,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                             self.writer,
-                            "call $tmp := Ge($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Ge($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1474,7 +1574,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                             self.writer,
-                            "call $tmp := Or($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $Or($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1486,7 +1586,7 @@ impl<'env> ModuleTranslator<'env> {
                         let op2 = srcs[1];
                         emitln!(
                             self.writer,
-                            "call $tmp := And($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
+                            "call $tmp := $And($GetLocal($m, $frame + {}), $GetLocal($m, $frame + {}));",
                             op1,
                             op2
                         );
@@ -1666,20 +1766,21 @@ impl<'env> ModuleTranslator<'env> {
     /// Determines whether this type has after-update invariants.
     fn has_after_update_invariant(&'env self, ty: &Type) -> bool {
         self.get_referred_struct(ty)
-            .map(|struct_env| SpecTranslator::has_after_update_invariant(&struct_env))
+            .map(|(struct_env, _)| SpecTranslator::has_after_update_invariant(&struct_env))
             .unwrap_or(false)
     }
 
     /// If ty is a mutable reference to a struct, return its environment.
-    fn get_referred_struct(&self, ty: &Type) -> Option<StructEnv<'_>> {
+    fn get_referred_struct(&self, ty: &Type) -> Option<(StructEnv<'_>, Vec<Type>)> {
         if let Type::Reference(true, bt) = &ty {
-            if let Type::Struct(module_idx, struct_idx, _) = bt.as_ref() {
-                return Some(
+            if let Type::Struct(module_idx, struct_idx, type_args) = bt.as_ref() {
+                return Some((
                     self.module_env
                         .env
                         .get_module(*module_idx)
                         .into_struct(*struct_idx),
-                );
+                    type_args.clone(),
+                ));
             }
         }
         None
@@ -1693,13 +1794,18 @@ impl<'env> ModuleTranslator<'env> {
         ty: &Type,
         idx: usize,
     ) {
-        if let Some(struct_env) = self.get_referred_struct(ty) {
+        if let Some((struct_env, type_args)) = self.get_referred_struct(ty) {
             if SpecTranslator::has_before_update_invariant(&struct_env) {
+                let args_str = type_args
+                    .iter()
+                    .map(|ty| boogie_type_value(self.module_env.env, ty))
+                    .chain(vec![boogie_var_before_borrow(idx)])
+                    .join(", ");
                 emitln!(
                     self.writer,
                     "call {}_before_update_inv({});",
                     boogie_struct_name(&struct_env),
-                    boogie_var_before_borrow(idx)
+                    args_str,
                 );
             }
         }
@@ -1713,17 +1819,24 @@ impl<'env> ModuleTranslator<'env> {
         ty: &Type,
         idx: usize,
     ) {
-        if let Some(struct_env) = self.get_referred_struct(ty) {
+        if let Some((struct_env, type_args)) = self.get_referred_struct(ty) {
             if SpecTranslator::has_after_update_invariant(&struct_env) {
                 let name = &boogie_var_before_borrow(idx);
                 emitln!(self.writer, "if ({}_used) {{", name);
                 self.writer.indent();
+                let args_str = type_args
+                    .iter()
+                    .map(|ty| boogie_type_value(self.module_env.env, ty))
+                    .chain(vec![
+                        name.clone(),
+                        format!("$Dereference($m, {}_ref)", name),
+                    ])
+                    .join(", ");
                 emitln!(
                     self.writer,
-                    "call {}_after_update_inv({}, $Dereference($m, {}_ref));",
+                    "call {}_after_update_inv({});",
                     boogie_struct_name(&struct_env),
-                    name,
-                    name,
+                    args_str,
                 );
                 emitln!(self.writer, "{}_used := false;", name);
                 self.writer.unindent();

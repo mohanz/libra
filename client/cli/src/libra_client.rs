@@ -2,36 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::AccountData;
-use anyhow::{bail, ensure, format_err, Result};
-use libra_json_rpc::{
+use anyhow::{bail, ensure, Result};
+use libra_json_rpc_client::{
     errors::JsonRpcError,
-    get_response_from_batch, process_batch_response,
-    views::{
-        AccountView, BlockMetadata, BytesView, EventView, ResponseAsView, StateProofView,
-        TransactionView,
-    },
-    JsonRpcBatch, JsonRpcResponse,
+    get_response_from_batch,
+    views::{AccountView, BlockMetadata, BytesView, EventView, StateProofView, TransactionView},
+    JsonRpcBatch, JsonRpcClient, JsonRpcResponse, ResponseAsView,
 };
 use libra_logger::prelude::*;
 use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
     account_config::{ACCOUNT_RECEIVED_EVENT_PATH, ACCOUNT_SENT_EVENT_PATH},
+    epoch_change::EpochChangeProof,
     ledger_info::LedgerInfoWithSignatures,
     transaction::{SignedTransaction, Version},
     trusted_state::{TrustedState, TrustedStateChange},
-    validator_change::ValidatorChangeProof,
     vm_error::StatusCode,
     waypoint::Waypoint,
 };
-use reqwest::{
-    blocking::{Client, ClientBuilder},
-    Url,
-};
-use std::time::Duration;
-
-const JSON_RPC_TIMEOUT_MS: u64 = 5_000;
-const MAX_JSON_RPC_RETRY_COUNT: u64 = 2;
+use reqwest::Url;
 
 /// A client connection to an AdmissionControl (AC) service. `LibraClient` also
 /// handles verifying the server's responses, retrying on non-fatal failures, and
@@ -57,77 +47,10 @@ pub struct LibraClient {
     latest_epoch_change_li: Option<LedgerInfoWithSignatures>,
 }
 
-pub struct JsonRpcClient {
-    url: Url,
-    client: Client,
-}
-
-impl JsonRpcClient {
-    pub fn new(url: Url) -> Result<Self> {
-        Ok(Self {
-            client: ClientBuilder::new().use_rustls_tls().build()?,
-            url,
-        })
-    }
-
-    /// Sends a JSON RPC batched request.
-    /// Returns a vector of responses s.t. response order matches the request order
-    pub fn execute(&mut self, batch: JsonRpcBatch) -> Result<Vec<Result<JsonRpcResponse>>> {
-        if batch.requests.is_empty() {
-            return Ok(vec![]);
-        }
-        let request = batch.json_request();
-
-        //retry send
-        let response = self
-            .send_with_retry(request)?
-            .error_for_status()
-            .map_err(|e| format_err!("Server returned error: {:?}", e))?;
-
-        let response = process_batch_response(batch.clone(), response.json()?)?;
-        ensure!(
-            batch.requests.len() == response.len(),
-            "received unexpected number of responses in batch"
-        );
-        Ok(response)
-    }
-
-    // send with retry
-    pub fn send_with_retry(
-        &mut self,
-        request: serde_json::Value,
-    ) -> Result<reqwest::blocking::Response> {
-        let mut response = self.send(&request);
-        let mut try_cnt = 0;
-
-        // retry if send fails
-        while try_cnt < MAX_JSON_RPC_RETRY_COUNT && response.is_err() {
-            response = self.send(&request);
-            try_cnt += 1;
-        }
-        response
-    }
-
-    fn send(&mut self, request: &serde_json::Value) -> Result<reqwest::blocking::Response> {
-        self.client
-            .post(self.url.clone())
-            .json(request)
-            .timeout(Duration::from_millis(JSON_RPC_TIMEOUT_MS))
-            .send()
-            .map_err(Into::into)
-    }
-}
-
 impl LibraClient {
     /// Construct a new Client instance.
-    // TODO(philiphayes/dmitrip): Waypoint should not be optional
-    pub fn new(url: Url, waypoint: Option<Waypoint>) -> Result<Self> {
-        // If waypoint is present, use it for initial verification, otherwise the initial
-        // verification is essentially empty.
-        let initial_trusted_state = match waypoint {
-            Some(waypoint) => TrustedState::from_waypoint(waypoint),
-            None => TrustedState::new_trust_any_genesis_WARNING_UNSAFE(),
-        };
+    pub fn new(url: Url, waypoint: Waypoint) -> Result<Self> {
+        let initial_trusted_state = TrustedState::from(waypoint);
         let client = JsonRpcClient::new(url)?;
         Ok(LibraClient {
             client,
@@ -266,8 +189,8 @@ impl LibraClient {
         let client_version = self.trusted_state.latest_version();
         let li: LedgerInfoWithSignatures =
             lcs::from_bytes(&state_proof.ledger_info_with_signatures.into_bytes()?)?;
-        let validator_change_proof: ValidatorChangeProof =
-            lcs::from_bytes(&state_proof.validator_change_proof.into_bytes()?)?;
+        let epoch_change_proof: EpochChangeProof =
+            lcs::from_bytes(&state_proof.epoch_change_proof.into_bytes()?)?;
 
         // check ledger info version
         ensure!(
@@ -280,29 +203,30 @@ impl LibraClient {
         // trusted_state_change
         match self
             .trusted_state
-            .verify_and_ratchet(&li, &validator_change_proof)?
+            .verify_and_ratchet(&li, &epoch_change_proof)?
         {
             TrustedStateChange::Epoch {
                 new_state,
                 latest_epoch_change_li,
-                latest_validator_set,
-                ..
             } => {
                 info!(
-                    "Verified epoch change to epoch: {}, validator set: [{}]",
-                    latest_epoch_change_li.ledger_info().epoch(),
-                    latest_validator_set
+                    "Verified epoch changed to {}",
+                    latest_epoch_change_li
+                        .ledger_info()
+                        .next_epoch_info()
+                        .expect("no validator set in epoch change ledger info"),
                 );
                 // Update client state
                 self.trusted_state = new_state;
                 self.latest_epoch_change_li = Some(latest_epoch_change_li.clone());
             }
-            TrustedStateChange::Version { new_state, .. } => {
+            TrustedStateChange::Version { new_state } => {
                 if self.trusted_state.latest_version() < new_state.latest_version() {
                     info!("Verified version change to: {}", new_state.latest_version());
                 }
                 self.trusted_state = new_state;
             }
+            TrustedStateChange::NoChange => (),
         }
         Ok(())
     }

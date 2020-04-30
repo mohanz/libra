@@ -102,4 +102,35 @@ module M {
     fun using_implies(x: u64): u64 {
         x
     }
+
+    spec module {
+        global x: u64;
+        local y: u64;
+        z: u64;
+        global generic<T>: u64;
+        invariant update generic<u64> = 23;
+        invariant update Self::generic<u64> = 24;
+    }
+
+    fun some_generic<T>() {
+    }
+    spec fun some_generic {
+        ensures generic<T> == 1;
+        ensures Self::generic<T> == 1;
+    }
+
+    spec schema ModuleInvariant<X, Y> {
+        requires global<X>(0x0).f == global<X>(0x1).f;
+        ensures global<X>(0x0).f == global<X>(0x1).f;
+    }
+
+    spec fun some_generic {
+        include ModuleInvariant<T, T>{foo:bar, x:y};
+    }
+
+    spec module {
+        apply ModuleInvariant<X, Y> to *foo*<Y, X>;
+        apply ModuleInvariant<X, Y> to *foo*<Y, X>, bar except public *, internal baz<X>;
+        pragma do_not_verify, timeout = 60;
+    }
 }

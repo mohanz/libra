@@ -123,7 +123,7 @@ impl VaultStorage {
         let secret = self.secret_name(key);
         let resp = self.client.read_secret(&secret, key)?;
         let last_update = DateTime::parse_from_rfc3339(&resp.creation_time)?.timestamp() as u64;
-        let value = Value::from_base64(&resp.value)?;
+        let value: Value = serde_json::from_str(&resp.value)?;
         Ok(GetResponse { last_update, value })
     }
 
@@ -131,7 +131,7 @@ impl VaultStorage {
     fn set_secret(&self, key: &str, value: Value) -> Result<(), Error> {
         let secret = self.secret_name(key);
         self.client
-            .write_secret(&secret, key, &value.to_base64()?)?;
+            .write_secret(&secret, key, &serde_json::to_string(&value)?)?;
         Ok(())
     }
 
@@ -235,7 +235,9 @@ impl KVStorage for VaultStorage {
         }
 
         self.set_secret(&key, value)?;
-        self.set_policies(key, &VaultEngine::KVSecrets, policy)?;
+        if !policy.is_default() {
+            self.set_policies(key, &VaultEngine::KVSecrets, policy)?;
+        }
         Ok(())
     }
 
@@ -266,7 +268,9 @@ impl CryptoStorage for VaultStorage {
         }
 
         self.client.create_ed25519_key(&ns_name, true)?;
-        self.set_policies(&ns_name, &VaultEngine::Transit, policy)?;
+        if !policy.is_default() {
+            self.set_policies(&ns_name, &VaultEngine::Transit, policy)?;
+        }
         self.get_public_key(name).map(|v| v.public_key)
     }
 

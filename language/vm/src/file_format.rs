@@ -27,8 +27,8 @@
 //! those structs translate to tables and table specifications.
 
 use crate::{
-    access::ModuleAccess, check_bounds::BoundsChecker, internals::ModuleIndex, IndexKind,
-    SignatureTokenKind,
+    access::ModuleAccess, check_bounds::BoundsChecker, errors::VMResult, internals::ModuleIndex,
+    IndexKind, SignatureTokenKind,
 };
 use libra_types::{
     account_address::AccountAddress,
@@ -354,7 +354,8 @@ impl StructDefinition {
     pub fn declared_field_count(&self) -> Result<MemberCount, VMStatus> {
         match &self.field_information {
             // TODO we might want a more informative error here
-            StructFieldInformation::Native => Err(VMStatus::new(StatusCode::LINKER_ERROR)),
+            StructFieldInformation::Native => Err(VMStatus::new(StatusCode::LINKER_ERROR)
+                .with_message("Looking for field in native structure".to_string())),
             StructFieldInformation::Declared(fields) => Ok(fields.len() as u16),
         }
     }
@@ -550,6 +551,40 @@ pub enum SignatureToken {
     TypeParameter(TypeParameterIndex),
 }
 
+/// An iterator to help traverse the `SignatureToken` in a non-recursive fashion to avoid
+/// overflowing the stack.
+///
+/// Traversal order: root -> left -> right
+pub struct SignatureTokenPreorderTraversalIter<'a> {
+    stack: Vec<&'a SignatureToken>,
+}
+
+impl<'a> Iterator for SignatureTokenPreorderTraversalIter<'a> {
+    type Item = &'a SignatureToken;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use SignatureToken::*;
+
+        match self.stack.pop() {
+            Some(tok) => {
+                match tok {
+                    Reference(inner_tok) | MutableReference(inner_tok) | Vector(inner_tok) => {
+                        self.stack.push(inner_tok)
+                    }
+
+                    StructInstantiation(_, inner_toks) => {
+                        self.stack.extend(inner_toks.iter().rev())
+                    }
+
+                    Bool | Address | U8 | U64 | U128 | Struct(_) | TypeParameter(_) => (),
+                }
+                Some(tok)
+            }
+            None => None,
+        }
+    }
+}
+
 /// `Arbitrary` for `SignatureToken` cannot be derived automatically as it's a recursive type.
 #[cfg(any(test, feature = "fuzzing"))]
 impl Arbitrary for SignatureToken {
@@ -687,6 +722,10 @@ impl SignatureToken {
             ),
         }
     }
+
+    pub fn preorder_traversal(&self) -> SignatureTokenPreorderTraversalIter<'_> {
+        SignatureTokenPreorderTraversalIter { stack: vec![self] }
+    }
 }
 
 /// A `Constant` is a serialized value along with it's type. That type will be deserialized by the
@@ -702,8 +741,6 @@ pub struct Constant {
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
 pub struct CodeUnit {
-    /// Max stack size for the function - currently unused.
-    pub max_stack_size: u16,
     /// List of locals type. All locals are typed.
     pub locals: SignatureIndex,
     /// Code stream, function body.
@@ -1342,8 +1379,11 @@ pub struct CompiledScriptMut {
     /// Constant pool. The constant values used in the transaction.
     pub constant_pool: ConstantPool,
 
-    /// The main (script) to execute.
-    pub main: FunctionDefinition,
+    pub type_parameters: Vec<Kind>,
+
+    pub parameters: SignatureIndex,
+
+    pub code: CodeUnit,
 }
 
 impl CompiledScript {
@@ -1366,23 +1406,130 @@ impl CompiledScript {
     ///
     /// If a `CompiledScript` has been bounds checked, the corresponding `CompiledModule` can be
     /// assumed to pass the bounds checker as well.
-    pub fn into_module(self) -> CompiledModule {
-        CompiledModule(self.0.into_module())
+    #[allow(deprecated)]
+    pub fn into_module(self) -> (ScriptConversionInfo, CompiledModule) {
+        let (info, m) = self.0.into_module();
+        (info, CompiledModule(m))
     }
+}
+
+pub struct ScriptConversionInfo {
+    // If a dummy address was added.
+    added_dummy_addr: bool,
+    // If an empty signature was added.
+    added_dummy_sig: bool,
+    // If the <SELF> identifier was added.
+    added_self_ident: bool,
+    // If a dummy self module handle was added.
+    added_self_module_handle: bool,
 }
 
 impl CompiledScriptMut {
     /// Converts this instance into `CompiledScript` after verifying it for basic internal
     /// consistency. This includes bounds checks but no others.
-    pub fn freeze(self) -> Result<CompiledScript, Vec<VMStatus>> {
-        let fake_module = self.into_module();
-        Ok(fake_module.freeze()?.into_script())
+    #[allow(deprecated)]
+    pub fn freeze(self) -> VMResult<CompiledScript> {
+        let (info, fake_module) = self.into_module();
+        Ok(fake_module.freeze()?.into_script(info))
     }
 
     /// Converts a `CompiledScriptMut` to a `CompiledModule` for code that wants a uniform view
     /// of both.
-    pub fn into_module(self) -> CompiledModuleMut {
-        CompiledModuleMut {
+    ///
+    /// This also produces a `ScriptConversionInfo`, which will be required to convert the
+    /// module back into a script.
+    ///
+    /// TODO: rewrite things that depend on this and get this removed.
+    #[deprecated(
+        note = "This function is deprecated and will be removed soon. Please do not introduce new dependencies."
+    )]
+    pub fn into_module(mut self) -> (ScriptConversionInfo, CompiledModuleMut) {
+        // Add the "<SELF>" identifier if it isn't present.
+        //
+        // Note: When adding an element to the table, in theory it is possible for the index
+        // to overflow. This will not be a problem if we get rid of the script/module conversion.
+        let (added_self_ident, self_ident_idx) = match self
+            .identifiers
+            .iter()
+            .position(|ident| ident.as_ident_str() == self_module_name())
+        {
+            Some(idx) => (false, IdentifierIndex::new(idx as u16)),
+            None => {
+                let idx = IdentifierIndex::new(self.identifiers.len() as u16);
+                self.identifiers
+                    .push(Identifier::new(self_module_name().to_string()).unwrap());
+                (true, idx)
+            }
+        };
+
+        // Use the first module handle as the self module handle. Create one if none exists.
+        //
+        // Note: this correctly handles scripts with either a proper self module handle or no module
+        // handles at all. For scripts whose first module handle is used to refer to external modules,
+        // the verifier may complain about not being able to find implementations for functioins.
+        //
+        // This is because the verifier always considers the first handle self, and it would be very
+        // tricky for us to fix this during conversion. (We don't want to shift the indices.)
+        //
+        // This will no longer be an issue once we remove script/module conversion so this won't be fixed.
+        let (added_self_module_handle, added_dummy_addr, self_module_handle_idx) =
+            if self.module_handles.is_empty() {
+                // Grab an arbitratry address. Create one if none exists.
+                let added_dummy_addr = self.address_identifiers.is_empty();
+                if added_dummy_addr {
+                    self.address_identifiers
+                        .push(AccountAddress::new([0xff; AccountAddress::LENGTH]));
+                }
+                let addr_idx = AddressIdentifierIndex::new(0);
+                let self_module_handle_idx =
+                    ModuleHandleIndex::new(self.module_handles.len() as u16);
+                self.module_handles.push(ModuleHandle {
+                    address: addr_idx,
+                    name: self_ident_idx,
+                });
+                (true, added_dummy_addr, self_module_handle_idx)
+            } else {
+                (false, false, ModuleHandleIndex::new(0 as u16))
+            };
+
+        // Find the index to the empty signature [].
+        // Create one if it doesn't exist.
+        let (added_dummy_sig, return_sig_idx) =
+            match self.signatures.iter().position(|sig| sig.0.is_empty()) {
+                Some(idx) => (false, SignatureIndex::new(idx as u16)),
+                None => {
+                    let idx = SignatureIndex::new(self.signatures.len() as u16);
+                    self.signatures.push(Signature(vec![]));
+                    (true, idx)
+                }
+            };
+
+        // Create a function handle for the main function.
+        let main_handle_idx = FunctionHandleIndex::new(self.function_handles.len() as u16);
+        self.function_handles.push(FunctionHandle {
+            module: self_module_handle_idx,
+            name: self_ident_idx,
+            parameters: self.parameters,
+            return_: return_sig_idx,
+            type_parameters: self.type_parameters,
+        });
+
+        // Create a function definition for the main function.
+        let main_def = FunctionDefinition {
+            function: main_handle_idx,
+            flags: CodeUnit::PUBLIC,
+            acquires_global_resources: vec![],
+            code: self.code,
+        };
+
+        let info = ScriptConversionInfo {
+            added_dummy_addr,
+            added_dummy_sig,
+            added_self_ident,
+            added_self_module_handle,
+        };
+
+        let m = CompiledModuleMut {
             module_handles: self.module_handles,
             struct_handles: self.struct_handles,
             function_handles: self.function_handles,
@@ -1399,8 +1546,10 @@ impl CompiledScriptMut {
             constant_pool: self.constant_pool,
 
             struct_defs: vec![],
-            function_defs: vec![self.main],
-        }
+            function_defs: vec![main_def],
+        };
+
+        (info, m)
     }
 }
 
@@ -1470,14 +1619,18 @@ impl Arbitrary for CompiledScriptMut {
                 vec(any::<Identifier>(), 0..=size),
                 vec(any::<AccountAddress>(), 0..=size),
             ),
-            any_with::<FunctionDefinition>(size),
+            vec(any::<Kind>(), 0..=size),
+            any::<SignatureIndex>(),
+            any::<CodeUnit>(),
         )
             .prop_map(
                 |(
                     (module_handles, struct_handles, function_handles),
                     signatures,
                     (identifiers, address_identifiers),
-                    main,
+                    type_parameters,
+                    parameters,
+                    code,
                 )| {
                     // TODO actual constant generation
                     CompiledScriptMut {
@@ -1489,7 +1642,9 @@ impl Arbitrary for CompiledScriptMut {
                         identifiers,
                         address_identifiers,
                         constant_pool: vec![],
-                        main,
+                        type_parameters,
+                        parameters,
+                        code,
                     }
                 },
             )
@@ -1577,13 +1732,9 @@ impl CompiledModuleMut {
 
     /// Converts this instance into `CompiledModule` after verifying it for basic internal
     /// consistency. This includes bounds checks but no others.
-    pub fn freeze(self) -> Result<CompiledModule, Vec<VMStatus>> {
-        let errors = BoundsChecker::new(&self).verify();
-        if errors.is_empty() {
-            Ok(CompiledModule(self))
-        } else {
-            Err(errors)
-        }
+    pub fn freeze(self) -> VMResult<CompiledModule> {
+        BoundsChecker::new(&self).verify()?;
+        Ok(CompiledModule(self))
     }
 }
 
@@ -1631,10 +1782,28 @@ impl CompiledModule {
     /// This function should only be called on an instance of CompiledModule obtained by invoking
     /// into_module on some instance of CompiledScript. This function is the inverse of
     /// into_module, i.e., script.into_module().into_script() == script.
-    pub fn into_script(self) -> CompiledScript {
+    #[deprecated(
+        note = "This function is deprecated and will be removed soon. Please do not introduce new dependencies."
+    )]
+    pub fn into_script(self, conv_info: ScriptConversionInfo) -> CompiledScript {
         let mut inner = self.into_inner();
         precondition!(!inner.function_defs.is_empty());
-        let main = inner.function_defs.remove(0);
+        let main = inner.function_defs.pop().unwrap();
+
+        if conv_info.added_dummy_addr {
+            inner.address_identifiers.pop().unwrap();
+        }
+        if conv_info.added_dummy_sig {
+            inner.signatures.pop().unwrap();
+        }
+        if conv_info.added_self_ident {
+            inner.identifiers.pop().unwrap();
+        }
+        if conv_info.added_self_module_handle {
+            inner.module_handles.pop().unwrap();
+        }
+        let main_handle = inner.function_handles.pop().unwrap();
+
         CompiledScript(CompiledScriptMut {
             module_handles: inner.module_handles,
             struct_handles: inner.struct_handles,
@@ -1648,7 +1817,9 @@ impl CompiledModule {
             address_identifiers: inner.address_identifiers,
             constant_pool: inner.constant_pool,
 
-            main,
+            type_parameters: main_handle.type_parameters,
+            parameters: main_handle.parameters,
+            code: main.code,
         })
     }
 }
@@ -1700,7 +1871,6 @@ pub fn basic_test_module() -> CompiledModuleMut {
         flags: 0,
         acquires_global_resources: vec![],
         code: CodeUnit {
-            max_stack_size: 0,
             locals: SignatureIndex(0),
             code: vec![],
         },
@@ -1751,44 +1921,24 @@ pub fn dummy_procedure_module(code: Vec<Bytecode>) -> CompiledModule {
 
 /// Return a simple script that contains only a return in the main()
 pub fn empty_script() -> CompiledScriptMut {
-    let default_address = AccountAddress::new([3u8; AccountAddress::LENGTH]);
-    let self_module_name = self_module_name().to_owned();
-    let main_name = Identifier::new("main").unwrap();
-    let signatures = vec![Signature(vec![])];
-    let self_module_handle = ModuleHandle {
-        address: AddressIdentifierIndex(0),
-        name: IdentifierIndex(0),
-    };
-    let main = FunctionHandle {
-        module: ModuleHandleIndex(0),
-        name: IdentifierIndex(1),
-        parameters: SignatureIndex(0),
-        return_: SignatureIndex(0),
-        type_parameters: vec![],
-    };
-    let code = CodeUnit {
-        max_stack_size: 1,
-        locals: SignatureIndex(0),
-        code: vec![Bytecode::Ret],
-    };
-    let main_def = FunctionDefinition {
-        function: FunctionHandleIndex(0),
-        flags: CodeUnit::PUBLIC,
-        acquires_global_resources: vec![],
-        code,
-    };
     CompiledScriptMut {
-        module_handles: vec![self_module_handle],
+        module_handles: vec![],
         struct_handles: vec![],
-        function_handles: vec![main],
+        function_handles: vec![],
 
         function_instantiations: vec![],
 
-        signatures,
+        signatures: vec![Signature(vec![])],
 
-        identifiers: vec![self_module_name, main_name],
-        address_identifiers: vec![default_address],
+        identifiers: vec![],
+        address_identifiers: vec![],
         constant_pool: vec![],
-        main: main_def,
+
+        type_parameters: vec![],
+        parameters: SignatureIndex(0),
+        code: CodeUnit {
+            locals: SignatureIndex(0),
+            code: vec![Bytecode::Ret],
+        },
     }
 }

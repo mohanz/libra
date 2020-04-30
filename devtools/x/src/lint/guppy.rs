@@ -4,7 +4,8 @@
 //! Project and package linters that run queries on guppy.
 
 use crate::config::EnforcedAttributesConfig;
-use std::collections::HashMap;
+use guppy::graph::BuildTargetId;
+use std::{collections::HashMap, ffi::OsStr};
 use x_lint::prelude::*;
 
 /// Ban certain crates from being used as direct dependencies.
@@ -132,6 +133,7 @@ impl PackageLinter for CrateNamesPaths {
                 "crate name contains '_' (use '-' instead)",
             );
         }
+
         let workspace_path = ctx.workspace_path();
         if let Some(path) = workspace_path.to_str() {
             if path.contains('_') {
@@ -143,6 +145,24 @@ impl PackageLinter for CrateNamesPaths {
         } else {
             // Workspace path is invalid UTF-8. A different lint should catch this.
         }
+
+        for build_target in ctx.metadata().build_targets() {
+            let target_name = build_target.name();
+            if target_name.contains('_') {
+                // If the path is implicitly specified by the name, don't warn about it.
+                let file_stem = build_target.path().file_stem();
+                if file_stem != Some(OsStr::new(target_name)) {
+                    out.write(
+                        LintLevel::Error,
+                        format!(
+                            "build target '{}' contains '_' (use '-' instead)",
+                            target_name
+                        ),
+                    );
+                }
+            }
+        }
+
         Ok(RunStatus::Executed)
     }
 }
@@ -189,6 +209,43 @@ impl PackageLinter for WorkspaceHack {
             .expect("valid package ID");
         if has_links && !has_hack_dep {
             out.write(LintLevel::Error, "missing libra-workspace-hack dependency");
+        }
+
+        Ok(RunStatus::Executed)
+    }
+}
+
+/// Ensure that any workspace packages with build dependencies also have a build script.
+#[derive(Debug)]
+pub struct IrrelevantBuildDeps;
+
+impl Linter for IrrelevantBuildDeps {
+    fn name(&self) -> &'static str {
+        "irrelevant-build-deps"
+    }
+}
+
+impl PackageLinter for IrrelevantBuildDeps {
+    fn run<'l>(
+        &self,
+        ctx: &PackageContext<'l>,
+        out: &mut LintFormatter<'l, '_>,
+    ) -> Result<RunStatus<'l>> {
+        let metadata = ctx.metadata();
+
+        // TODO: clean up with guppy 0.4.
+        let has_build_script = metadata.build_target(&BuildTargetId::BuildScript).is_some();
+
+        let has_build_dep = ctx
+            .project_ctx()
+            .package_graph()
+            .unwrap()
+            .dep_links(metadata.id())
+            .unwrap()
+            .any(|link| link.edge.build().is_some());
+
+        if !has_build_script && has_build_dep {
+            out.write(LintLevel::Error, "build dependencies but no build script");
         }
 
         Ok(RunStatus::Executed)

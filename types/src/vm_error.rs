@@ -295,6 +295,15 @@ pub enum StatusCode {
     // Gas unit price submitted with the transaction is above the maximum
     // gas price set in the VM.
     GAS_UNIT_PRICE_ABOVE_MAX_BOUND = 16,
+    // Gas specifier submitted is either malformed (not a valid identifier),
+    // or does not refer to an accepted gas specifier
+    INVALID_GAS_SPECIFIER = 17,
+    // The sending account is frozen
+    SENDING_ACCOUNT_FROZEN = 18,
+    // Unable to deserialize the account blob
+    UNABLE_TO_DESERIALIZE_ACCOUNT = 19,
+    // The currency info was unable to be found
+    CURRENCY_INFO_DOES_NOT_EXIST = 20,
 
     // When a code module/script is published it is verified. These are the
     // possible errors that can arise from the verification process.
@@ -385,9 +394,12 @@ pub enum StatusCode {
     /// Reported when a struct has zero fields
     ZERO_SIZED_STRUCT = 1080,
     LINKER_ERROR = 1081,
-    /// Constant's verification errors
     INVALID_CONSTANT_TYPE = 1082,
     MALFORMED_CONSTANT_DATA = 1083,
+    EMPTY_CODE_UNIT = 1084,
+    INVALID_LOOP_SPLIT = 1085,
+    INVALID_LOOP_BREAK = 1086,
+    INVALID_LOOP_CONTINUE = 1087,
 
     // These are errors that the VM might raise if a violation of internal
     // invariants takes place.
@@ -406,6 +418,7 @@ pub enum StatusCode {
     UNREACHABLE = 2011,
     VM_STARTUP_FAILURE = 2012,
     NATIVE_FUNCTION_INTERNAL_INCONSISTENCY = 2013,
+    INVALID_CODE_CACHE = 2014,
 
     // Errors that can arise from binary decoding (deserialization)
     // Deserializtion Errors: 3000-3999
@@ -680,6 +693,7 @@ pub mod sub_status {
     pub const AED_DIVISION_BY_ZERO: u64 = 3;
 
     pub const VSF_GAS_SCHEDULE_NOT_FOUND: u64 = 0;
+    pub const VSF_LIBRA_VERSION_NOT_FOUND: u64 = 1;
 
     // Dynamic Reference status sub-codes
     pub const DRE_UNKNOWN_DYNAMIC_REFERENCE_ERROR: u64 = 0;

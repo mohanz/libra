@@ -4,23 +4,28 @@
 use crate::{BuildSwarm, Error, ValidatorConfig};
 use anyhow::{ensure, Result};
 use libra_config::{
-    config::{NetworkPeersConfig, NodeConfig, RoleType, SeedPeersConfig, UpstreamPeersConfig},
+    config::{
+        NetworkPeersConfig, NodeConfig, PeerNetworkId, RoleType, SeedPeersConfig, UpstreamConfig,
+    },
     utils,
 };
 use libra_crypto::ed25519::Ed25519PrivateKey;
+use libra_network_address::NetworkAddress;
 use libra_types::transaction::Transaction;
-use parity_multiaddr::Multiaddr;
 use rand::{rngs::StdRng, SeedableRng};
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 pub struct FullNodeConfig {
-    advertised: Multiaddr,
-    bootstrap: Multiaddr,
+    advertised: NetworkAddress,
+    bootstrap: NetworkAddress,
     full_node_index: usize,
     full_node_seed: [u8; 32],
     full_nodes: usize,
     genesis: Option<Transaction>,
-    listen: Multiaddr,
+    listen: NetworkAddress,
     enable_remote_authentication: bool,
     template: NodeConfig,
     validator_config: ValidatorConfig,
@@ -36,13 +41,13 @@ impl Default for FullNodeConfig {
         template.base.role = RoleType::FullNode;
 
         Self {
-            advertised: DEFAULT_ADVERTISED.parse::<Multiaddr>().unwrap(),
-            bootstrap: DEFAULT_ADVERTISED.parse::<Multiaddr>().unwrap(),
+            advertised: NetworkAddress::from_str(DEFAULT_ADVERTISED).unwrap(),
+            bootstrap: NetworkAddress::from_str(DEFAULT_ADVERTISED).unwrap(),
             full_node_index: 0,
             full_node_seed: DEFAULT_SEED,
             full_nodes: 1,
             genesis: None,
-            listen: DEFAULT_LISTEN.parse::<Multiaddr>().unwrap(),
+            listen: NetworkAddress::from_str(DEFAULT_LISTEN).unwrap(),
             enable_remote_authentication: true,
             template,
             validator_config: ValidatorConfig::new(),
@@ -55,12 +60,12 @@ impl FullNodeConfig {
         Self::default()
     }
 
-    pub fn advertised(&mut self, advertised: Multiaddr) -> &mut Self {
+    pub fn advertised(&mut self, advertised: NetworkAddress) -> &mut Self {
         self.advertised = advertised;
         self
     }
 
-    pub fn bootstrap(&mut self, bootstrap: Multiaddr) -> &mut Self {
+    pub fn bootstrap(&mut self, bootstrap: NetworkAddress) -> &mut Self {
         self.bootstrap = bootstrap;
         self
     }
@@ -85,7 +90,7 @@ impl FullNodeConfig {
         self
     }
 
-    pub fn listen(&mut self, listen: Multiaddr) -> &mut Self {
+    pub fn listen(&mut self, listen: NetworkAddress) -> &mut Self {
         self.listen = listen;
         self
     }
@@ -196,6 +201,7 @@ impl FullNodeConfig {
             } else {
                 validator_config.execution.genesis.clone()
             };
+            config.base.waypoint = validator_config.base.waypoint;
 
             let network = config
                 .full_node_networks
@@ -222,19 +228,20 @@ impl FullNodeConfig {
             .full_node_networks
             .last()
             .ok_or(Error::MissingFullNodeNetwork)?;
-        let upstream_peers = UpstreamPeersConfig {
-            upstream_peers: vec![validator_full_node_network.peer_id],
-        };
-
         let seed_peers = self.build_seed_peers(&validator_full_node_config)?;
+        let upstream_peer_id = validator_full_node_network.peer_id;
         for config in configs.iter_mut() {
-            config.state_sync.upstream_peers = upstream_peers.clone();
             let network = config
                 .full_node_networks
                 .last_mut()
                 .ok_or(Error::MissingFullNodeNetwork)?;
             network.network_peers = network_peers.clone();
             network.seed_peers = seed_peers.clone();
+            let mut upstream = UpstreamConfig::default();
+            upstream.upstream_peers = vec![PeerNetworkId(network.peer_id, upstream_peer_id)]
+                .into_iter()
+                .collect::<HashSet<_>>();
+            config.upstream = upstream;
         }
 
         Ok((configs, faucet_key))
@@ -275,17 +282,17 @@ mod test {
         assert_eq!(network.advertised_address, seed_peer_ips[0]);
         assert_eq!(
             network.advertised_address,
-            DEFAULT_ADVERTISED.parse::<Multiaddr>().unwrap()
+            NetworkAddress::from_str(DEFAULT_ADVERTISED).unwrap()
         );
         assert_eq!(
             network.listen_address,
-            DEFAULT_LISTEN.parse::<Multiaddr>().unwrap()
+            NetworkAddress::from_str(DEFAULT_LISTEN).unwrap()
         );
         assert!(config.execution.genesis.is_some());
     }
 
     #[test]
-    fn verify_state_sync() {
+    fn verify_upstream_config() {
         let mut validator_config = ValidatorConfig::new().build().unwrap();
         FullNodeConfig::new()
             .extend_validator(&mut validator_config)
@@ -293,10 +300,11 @@ mod test {
         let val_fn = &validator_config.full_node_networks[0];
 
         let fnc = FullNodeConfig::new().build().unwrap();
-        assert_eq!(
-            val_fn.peer_id,
-            fnc.state_sync.upstream_peers.upstream_peers[0]
-        );
+        let fn_network_id = fnc.full_node_networks[0].peer_id;
+        assert!(fnc
+            .upstream
+            .upstream_peers
+            .contains(&PeerNetworkId(fn_network_id, val_fn.peer_id)));
     }
 
     #[test]

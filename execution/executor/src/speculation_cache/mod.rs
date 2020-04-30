@@ -27,7 +27,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
 };
-use storage_proto::StartupInfo;
+use storage_interface::{StartupInfo, TreeState};
 
 /// The struct that stores all speculation result of its counterpart in consensus.
 pub(crate) struct SpeculationBlock {
@@ -127,6 +127,19 @@ impl SpeculationCache {
         cache
     }
 
+    pub fn new_for_db_bootstrapping(tree_state: TreeState) -> Self {
+        // The DB-bootstrapper applies genesis txn on a local DB and create a waypoint,
+        // assuming everything is synced and committed.
+        let executor_trees = ExecutedTrees::from(tree_state);
+        Self {
+            synced_trees: executor_trees.clone(),
+            committed_trees: executor_trees,
+            heads: vec![],
+            block_map: Arc::new(Mutex::new(HashMap::new())),
+            committed_block_id: *PRE_GENESIS_BLOCK_ID,
+        }
+    }
+
     pub fn committed_block_id(&self) -> HashValue {
         self.committed_block_id
     }
@@ -144,7 +157,7 @@ impl SpeculationCache {
         committed_trees: ExecutedTrees,
         committed_ledger_info: &LedgerInfo,
     ) {
-        let new_root_block_id = if committed_ledger_info.next_validator_set().is_some() {
+        let new_root_block_id = if committed_ledger_info.next_epoch_info().is_some() {
             // Update the root block id with reconfig virtual block id, to be consistent
             // with the logic of Consensus.
             let id = Block::<()>::make_genesis_block_from_ledger_info(committed_ledger_info).id();

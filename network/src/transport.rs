@@ -9,14 +9,14 @@ use crate::{
     },
 };
 use futures::io::{AsyncRead, AsyncWrite};
-use libra_crypto::{traits::ValidKey, x25519};
+use libra_crypto::{traits::ValidCryptoMaterial, x25519};
 use libra_logger::prelude::*;
+use libra_network_address::NetworkAddress;
 use libra_security_logger::{security_log, SecurityEvent};
 use libra_types::PeerId;
 use netcore::transport::{boxed, memory, tcp, ConnectionOrigin, TransportExt};
 use noise::NoiseConfig;
 use once_cell::sync::Lazy;
-use parity_multiaddr::Multiaddr;
 use std::{
     collections::HashMap,
     convert::TryFrom,
@@ -82,7 +82,7 @@ impl ConnectionIdGenerator {
 pub struct ConnectionMetadata {
     peer_id: PeerId,
     connection_id: ConnectionId,
-    addr: Multiaddr,
+    addr: NetworkAddress,
     origin: ConnectionOrigin,
     messaging_protocol: MessagingProtocolVersion,
     application_protocols: SupportedProtocols,
@@ -92,7 +92,7 @@ impl ConnectionMetadata {
     pub fn new(
         peer_id: PeerId,
         connection_id: ConnectionId,
-        addr: Multiaddr,
+        addr: NetworkAddress,
         origin: ConnectionOrigin,
         messaging_protocol: MessagingProtocolVersion,
         application_protocols: SupportedProtocols,
@@ -115,7 +115,7 @@ impl ConnectionMetadata {
         self.connection_id
     }
 
-    pub fn addr(&self) -> &Multiaddr {
+    pub fn addr(&self) -> &NetworkAddress {
         &self.addr
     }
 
@@ -148,7 +148,7 @@ fn identity_key_to_peer_id(
 pub async fn perform_handshake<T: TSocket>(
     peer_id: PeerId,
     mut socket: T,
-    addr: Multiaddr,
+    addr: NetworkAddress,
     origin: ConnectionOrigin,
     own_handshake: &HandshakeMsg,
 ) -> Result<Connection<T>, io::Error> {

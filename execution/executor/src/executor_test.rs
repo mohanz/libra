@@ -3,14 +3,14 @@
 
 use super::*;
 use crate::{
-    db_bootstrapper::maybe_bootstrap_db,
+    db_bootstrapper::bootstrap_db_if_empty,
     mock_vm::{
         encode_mint_transaction, encode_reconfiguration_transaction, encode_transfer_transaction,
         MockVM, DISCARD_STATUS, KEEP_STATUS,
     },
-    Executor, OP_COUNTERS,
+    BlockExecutor, Executor,
 };
-use libra_config::config::NodeConfig;
+use libra_config::{config::NodeConfig, utils::get_genesis_txn};
 use libra_crypto::{ed25519::Ed25519PrivateKey, HashValue};
 use libra_types::{
     account_address::AccountAddress,
@@ -18,13 +18,10 @@ use libra_types::{
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     transaction::{Transaction, TransactionListWithProof, Version},
 };
+use libradb::LibraDB;
 use proptest::prelude::*;
 use rand::Rng;
-use rusty_fork::{rusty_fork_id, rusty_fork_test, rusty_fork_test_name};
 use std::collections::BTreeMap;
-use storage_client::{StorageRead, StorageReadServiceClient, SyncStorageClient};
-use storage_service::{init_libra_db, start_storage_service_with_db};
-use tokio::runtime::Runtime;
 
 fn build_test_config() -> (NodeConfig, Ed25519PrivateKey) {
     let mut validator_config = config_builder::ValidatorConfig::new();
@@ -37,15 +34,11 @@ fn build_test_config() -> (NodeConfig, Ed25519PrivateKey) {
     (configs.swap_remove(0), key)
 }
 
-fn create_storage(config: &NodeConfig) -> Runtime {
-    let (arc_db, db_reader_writer) = init_libra_db(&config);
-    maybe_bootstrap_db::<MockVM>(db_reader_writer, &config)
+fn create_storage(config: &NodeConfig) -> DbReaderWriter {
+    let db = DbReaderWriter::new(LibraDB::new(config.storage.dir()));
+    bootstrap_db_if_empty::<MockVM>(&db, get_genesis_txn(&config).unwrap())
         .expect("Db-bootstrapper should not fail.");
-    start_storage_service_with_db(&config, arc_db)
-}
-
-fn create_executor(config: &NodeConfig) -> Executor<MockVM> {
-    Executor::new(SyncStorageClient::new(&config.storage.address).into())
+    db
 }
 
 fn execute_and_commit_block(
@@ -69,19 +62,17 @@ fn execute_and_commit_block(
 struct TestExecutor {
     // The config is kept around because it owns the temp dir used in the test.
     _config: NodeConfig,
-    storage_server: Option<Runtime>,
     executor: Executor<MockVM>,
 }
 
 impl TestExecutor {
     fn new() -> TestExecutor {
         let (config, _) = build_test_config();
-        let storage_server = create_storage(&config);
-        let executor = create_executor(&config);
+        let db = create_storage(&config);
+        let executor = Executor::<MockVM>::new(db);
 
         TestExecutor {
             _config: config,
-            storage_server: Some(storage_server),
             executor,
         }
     }
@@ -98,14 +89,6 @@ impl std::ops::Deref for TestExecutor {
 impl std::ops::DerefMut for TestExecutor {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.executor
-    }
-}
-
-impl Drop for TestExecutor {
-    fn drop(&mut self) {
-        self.storage_server
-            .take()
-            .expect("Storage server should exist.");
     }
 }
 
@@ -253,23 +236,10 @@ fn test_executor_execute_same_block_multiple_times() {
     assert_eq!(responses.len(), 1);
 }
 
-rusty_fork_test! {
-    #[test]
-    fn test_num_accounts_created_counter() {
-        let mut executor = TestExecutor::new();
-        let mut parent_block_id = executor.committed_block_id();
-        for i in 0..20 {
-            parent_block_id = execute_and_commit_block(&mut executor, parent_block_id, i);
-            assert_eq!(OP_COUNTERS.counter("num_accounts").get() as u64, i + 1);
-        }
-    }
-}
-
 /// Generates a list of `TransactionListWithProof`s according to the given ranges.
 fn create_transaction_chunks(
     chunk_ranges: Vec<std::ops::Range<Version>>,
 ) -> (Vec<TransactionListWithProof>, LedgerInfoWithSignatures) {
-    let mut rt = Runtime::new().unwrap();
     assert_eq!(chunk_ranges.first().unwrap().start, 1);
     for i in 1..chunk_ranges.len() {
         let previous_range = &chunk_ranges[i - 1];
@@ -283,8 +253,8 @@ fn create_transaction_chunks(
     // To obtain the batches of transactions, we first execute and save all these transactions in a
     // separate DB. Then we call get_transactions to retrieve them.
     let (config, _) = build_test_config();
-    let storage_server = create_storage(&config);
-    let mut executor = create_executor(&config);
+    let db = create_storage(&config);
+    let mut executor = Executor::<MockVM>::new(db.clone());
 
     let mut txns = vec![];
     for i in 1..chunk_ranges.last().unwrap().end {
@@ -302,29 +272,25 @@ fn create_transaction_chunks(
         .commit_blocks(vec![id], ledger_info.clone())
         .unwrap();
 
-    let storage_client = StorageReadServiceClient::new(&config.storage.address);
-
     let batches: Vec<_> = chunk_ranges
         .into_iter()
         .map(|range| {
-            rt.block_on(storage_client.get_transactions(
-                range.start,
-                range.end - range.start,
-                ledger_version,
-                false, /* fetch_events */
-            ))
-            .unwrap()
+            db.reader
+                .get_transactions(
+                    range.start,
+                    range.end - range.start,
+                    ledger_version,
+                    false, /* fetch_events */
+                )
+                .unwrap()
         })
         .collect();
-
-    drop(storage_server);
 
     (batches, ledger_info)
 }
 
 #[test]
 fn test_executor_execute_and_commit_chunk() {
-    let mut rt = Runtime::new().unwrap();
     let first_batch_size = 30;
     let second_batch_size = 40;
     let third_batch_size = 20;
@@ -343,17 +309,14 @@ fn test_executor_execute_and_commit_chunk() {
 
     // Now we execute these two chunks of transactions.
     let (config, _) = build_test_config();
-    let storage_server = create_storage(&config);
-    let mut executor = create_executor(&config);
-    let storage_client = StorageReadServiceClient::new(&config.storage.address);
+    let db = create_storage(&config);
+    let mut executor = Executor::<MockVM>::new(db.clone());
 
     // Execute the first chunk. After that we should still get the genesis ledger info from DB.
     executor
         .execute_and_commit_chunk(chunks[0].clone(), ledger_info.clone(), None)
         .unwrap();
-    let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
-        .unwrap();
+    let li = db.reader.get_latest_ledger_info().unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), HashValue::zero());
 
@@ -361,9 +324,7 @@ fn test_executor_execute_and_commit_chunk() {
     executor
         .execute_and_commit_chunk(chunks[1].clone(), ledger_info.clone(), None)
         .unwrap();
-    let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
-        .unwrap();
+    let li = db.reader.get_latest_ledger_info().unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), HashValue::zero());
 
@@ -375,9 +336,7 @@ fn test_executor_execute_and_commit_chunk() {
             None,
         )
         .unwrap();
-    let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
-        .unwrap();
+    let li = db.reader.get_latest_ledger_info().unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), HashValue::zero());
 
@@ -385,9 +344,7 @@ fn test_executor_execute_and_commit_chunk() {
     executor
         .execute_and_commit_chunk(chunks[1].clone(), ledger_info.clone(), None)
         .unwrap();
-    let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
-        .unwrap();
+    let li = db.reader.get_latest_ledger_info().unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), HashValue::zero());
 
@@ -395,17 +352,12 @@ fn test_executor_execute_and_commit_chunk() {
     executor
         .execute_and_commit_chunk(chunks[2].clone(), ledger_info.clone(), None)
         .unwrap();
-    let (_, li, _, _) = rt
-        .block_on(storage_client.update_to_latest_ledger(0, vec![]))
-        .unwrap();
+    let li = db.reader.get_latest_ledger_info().unwrap();
     assert_eq!(li, ledger_info);
-
-    drop(storage_server);
 }
 
 #[test]
 fn test_executor_execute_and_commit_chunk_restart() {
-    let mut rt = Runtime::new().unwrap();
     let first_batch_size = 30;
     let second_batch_size = 40;
 
@@ -419,38 +371,30 @@ fn test_executor_execute_and_commit_chunk_restart() {
     };
 
     let (config, _) = build_test_config();
-    let storage_server = create_storage(&config);
+    let db = create_storage(&config);
 
     // First we simulate syncing the first chunk of transactions.
     {
-        let mut executor = create_executor(&config);
-        let storage_client = StorageReadServiceClient::new(&config.storage.address);
+        let mut executor = Executor::<MockVM>::new(db.clone());
 
         executor
             .execute_and_commit_chunk(chunks[0].clone(), ledger_info.clone(), None)
             .unwrap();
-        let (_, li, _, _) = rt
-            .block_on(storage_client.update_to_latest_ledger(0, vec![]))
-            .unwrap();
+        let li = db.reader.get_latest_ledger_info().unwrap();
         assert_eq!(li.ledger_info().version(), 0);
         assert_eq!(li.ledger_info().consensus_block_id(), HashValue::zero());
     }
 
     // Then we restart executor and resume to the next chunk.
     {
-        let mut executor = create_executor(&config);
-        let storage_client = StorageReadServiceClient::new(&config.storage.address);
+        let mut executor = Executor::<MockVM>::new(db.clone());
 
         executor
             .execute_and_commit_chunk(chunks[1].clone(), ledger_info.clone(), None)
             .unwrap();
-        let (_, li, _, _) = rt
-            .block_on(storage_client.update_to_latest_ledger(0, vec![]))
-            .unwrap();
+        let li = db.reader.get_latest_ledger_info().unwrap();
         assert_eq!(li, ledger_info);
     }
-
-    drop(storage_server);
 }
 
 #[test]
@@ -468,8 +412,8 @@ fn test_executor_execute_and_commit_chunk_local_result_mismatch() {
     };
 
     let (config, _) = build_test_config();
-    let _storage_server = create_storage(&config);
-    let mut executor = create_executor(&config);
+    let db = create_storage(&config);
+    let mut executor = Executor::<MockVM>::new(db);
     // commit 5 txns first.
     {
         let parent_block_id = executor.committed_block_id();
@@ -622,13 +566,13 @@ proptest! {
         let block_b = TestBlock::new(0..b_size, amount, gen_block_id(2));
 
         let (config, _) = build_test_config();
-        let storage_server = create_storage(&config);
+        let db = create_storage(&config);
         let mut parent_block_id;
         let mut root_hash;
 
         // First execute and commit one block, then destroy executor.
         {
-            let mut executor = create_executor(&config);
+            let mut executor = Executor::<MockVM>::new(db.clone());
             parent_block_id = executor.committed_block_id();
             let output_a = executor.execute_block(
                 (block_a.id, block_a.txns.clone()), parent_block_id
@@ -641,7 +585,7 @@ proptest! {
 
         // Now we construct a new executor and run one more block.
         {
-            let mut executor = create_executor(&config);
+            let mut executor = Executor::<MockVM>::new(db);
             let output_b = executor.execute_block((block_b.id, block_b.txns.clone()), parent_block_id).unwrap();
             root_hash = output_b.root_hash();
             let ledger_info = gen_ledger_info(
@@ -660,8 +604,6 @@ proptest! {
             txns
         });
         prop_assert_eq!(root_hash, expected_root_hash);
-
-        drop(storage_server);
     }
 
     #[test]
@@ -675,8 +617,8 @@ proptest! {
             ]);
 
         let (config, _) = build_test_config();
-        let storage_server = create_storage(&config);
-        let mut executor = create_executor(&config);
+        let db = create_storage(&config);
+        let mut executor = Executor::<MockVM>::new(db);
         let parent_block_id = executor.committed_block_id();
 
         let overlap_txn_list_with_proof = chunks.pop().unwrap();
@@ -711,7 +653,5 @@ proptest! {
             vec![first_block_id, second_block_id],
             ledger_info,
         ).unwrap();
-
-        drop(storage_server);
     }
 }

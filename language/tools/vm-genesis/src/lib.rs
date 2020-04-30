@@ -5,28 +5,32 @@
 
 mod genesis_gas_schedule;
 
-use crate::genesis_gas_schedule::initial_gas_schedule;
+use crate::genesis_gas_schedule::INITIAL_GAS_SCHEDULE;
 use anyhow::Result;
 use bytecode_verifier::VerifiedModule;
-use libra_config::{config::NodeConfig, generator};
+use libra_config::config::NodeConfig;
 use libra_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
-    traits::ValidKey,
-    PrivateKey, Uniform,
+    PrivateKey, Uniform, ValidCryptoMaterial,
 };
+use libra_network_address::RawNetworkAddress;
 use libra_state_view::StateView;
 use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
     account_config,
     contract_event::ContractEvent,
-    discovery_set::DiscoverySet,
-    language_storage::ModuleId,
-    on_chain_config::{new_epoch_event_key, VMPublishingOption, ValidatorSet},
-    transaction::{authenticator::AuthenticationKey, ChangeSet, Transaction},
+    language_storage::{ModuleId, StructTag, TypeTag},
+    on_chain_config::{new_epoch_event_key, VMPublishingOption},
+    transaction::{
+        authenticator::AuthenticationKey, ChangeSet, Script, Transaction, TransactionArgument,
+    },
 };
-use libra_vm::system_module_names::*;
-use move_core_types::identifier::Identifier;
+use libra_vm::{self, system_module_names::*};
+use move_core_types::{
+    gas_schedule::{CostTable, GasAlgebra, GasUnits},
+    identifier::Identifier,
+};
 use move_vm_runtime::MoveVM;
 use move_vm_state::{
     data_cache::BlockDataCache,
@@ -35,10 +39,10 @@ use move_vm_state::{
 use move_vm_types::{chain_state::ChainState, values::Value};
 use once_cell::sync::Lazy;
 use rand::prelude::*;
+use std::{collections::HashMap, convert::TryFrom};
 use stdlib::{stdlib_modules, transaction_scripts::StdlibScript, StdLibOptions};
 use vm::{
-    access::ModuleAccess,
-    gas_schedule::{CostTable, GasAlgebra, GasUnits},
+    access::ModuleAccess, gas_schedule::zero_cost_schedule,
     transaction_metadata::TransactionMetadata,
 };
 
@@ -55,15 +59,16 @@ pub static GENESIS_KEYPAIR: Lazy<(Ed25519PrivateKey, Ed25519PublicKey)> = Lazy::
     (private_key, public_key)
 });
 
+pub type ValidatorRegistration = (Ed25519PublicKey, Script);
+
 // Identifiers for well-known functions.
-static ADD_VALIDATOR: Lazy<Identifier> = Lazy::new(|| Identifier::new("add_validator_").unwrap());
+static ADD_VALIDATOR: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("add_validator_no_discovery_event").unwrap());
 static INITIALIZE: Lazy<Identifier> = Lazy::new(|| Identifier::new("initialize").unwrap());
 static INITIALIZE_BLOCK: Lazy<Identifier> =
     Lazy::new(|| Identifier::new("initialize_block_metadata").unwrap());
 static INITIALIZE_CONFIG: Lazy<Identifier> =
     Lazy::new(|| Identifier::new("initialize_configuration").unwrap());
-static INITIALIZE_TXN_FEES: Lazy<Identifier> =
-    Lazy::new(|| Identifier::new("initialize_transaction_fees").unwrap());
 static INITIALIZE_VALIDATOR_SET: Lazy<Identifier> =
     Lazy::new(|| Identifier::new("initialize_validator_set").unwrap());
 static INITIALIZE_DISCOVERY_SET: Lazy<Identifier> =
@@ -74,23 +79,14 @@ static RECONFIGURE: Lazy<Identifier> =
     Lazy::new(|| Identifier::new("emit_reconfiguration_event").unwrap());
 static EMIT_DISCOVERY_SET: Lazy<Identifier> =
     Lazy::new(|| Identifier::new("emit_discovery_set_change").unwrap());
-static REGISTER_CANDIDATE_VALIDATOR: Lazy<Identifier> =
-    Lazy::new(|| Identifier::new("register_candidate_validator").unwrap());
 static ROTATE_AUTHENTICATION_KEY: Lazy<Identifier> =
     Lazy::new(|| Identifier::new("rotate_authentication_key").unwrap());
 static EPILOGUE: Lazy<Identifier> = Lazy::new(|| Identifier::new("epilogue").unwrap());
 
-static ASSOCIATION_MODULE: Lazy<ModuleId> = Lazy::new(|| {
+static VM_CONFIG_MODULE: Lazy<ModuleId> = Lazy::new(|| {
     ModuleId::new(
         account_config::CORE_CODE_ADDRESS,
-        Identifier::new("Association").unwrap(),
-    )
-});
-
-static SCRIPT_WHITELIST_MODULE: Lazy<ModuleId> = Lazy::new(|| {
-    ModuleId::new(
-        account_config::CORE_CODE_ADDRESS,
-        Identifier::new("ScriptWhitelist").unwrap(),
+        Identifier::new("LibraVMConfig").unwrap(),
     )
 });
 
@@ -101,13 +97,6 @@ static LIBRA_VERSION_MODULE: Lazy<ModuleId> = Lazy::new(|| {
     )
 });
 
-static LBR_MODULE: Lazy<ModuleId> = Lazy::new(|| {
-    ModuleId::new(
-        account_config::CORE_CODE_ADDRESS,
-        Identifier::new("LBR").unwrap(),
-    )
-});
-
 static LIBRA_TIME_MODULE: Lazy<ModuleId> = Lazy::new(|| {
     ModuleId::new(
         account_config::CORE_CODE_ADDRESS,
@@ -115,20 +104,25 @@ static LIBRA_TIME_MODULE: Lazy<ModuleId> = Lazy::new(|| {
     )
 });
 
+pub fn module(name: &str) -> ModuleId {
+    ModuleId::new(
+        account_config::CORE_CODE_ADDRESS,
+        Identifier::new(name).unwrap(),
+    )
+}
+
+pub fn name(name: &str) -> Identifier {
+    Identifier::new(name).unwrap()
+}
+
 pub fn encode_genesis_transaction_with_validator(
-    private_key: &Ed25519PrivateKey,
     public_key: Ed25519PublicKey,
-    nodes: &[NodeConfig],
-    validator_set: ValidatorSet,
-    discovery_set: DiscoverySet,
+    validators: &[ValidatorRegistration],
     vm_publishing_option: Option<VMPublishingOption>,
 ) -> Transaction {
     encode_genesis_transaction(
-        private_key,
         public_key,
-        nodes,
-        validator_set,
-        discovery_set,
+        validators,
         stdlib_modules(StdLibOptions::Staged), // Must use staged stdlib
         vm_publishing_option
             .unwrap_or_else(|| VMPublishingOption::Locked(StdlibScript::whitelist())),
@@ -137,17 +131,19 @@ pub fn encode_genesis_transaction_with_validator(
 
 pub fn encode_genesis_change_set(
     public_key: &Ed25519PublicKey,
-    nodes: &[NodeConfig],
-    validator_set: ValidatorSet,
-    discovery_set: DiscoverySet,
+    validators: &[ValidatorRegistration],
     stdlib_modules: &[VerifiedModule],
     vm_publishing_option: VMPublishingOption,
 ) -> ChangeSet {
     let move_vm = MoveVM::new();
 
     // create a data view for move_vm
-    let state_view = GenesisStateView;
-    let gas_schedule = CostTable::zero();
+    let mut state_view = GenesisStateView::new();
+    let gas_schedule = zero_cost_schedule();
+    for module in stdlib_modules {
+        let module_id = module.self_id();
+        state_view.add_module(&module_id, &module);
+    }
     let data_cache = BlockDataCache::new(&state_view);
 
     // create an execution context for the move_vm.
@@ -160,8 +156,17 @@ pub fn encode_genesis_change_set(
     // code to create those. However, code lives under an account but we have none.
     // So we are pushing code into the VM blindly in order to create the main accounts.
     for module in stdlib_modules {
-        move_vm.cache_module(module.clone());
+        move_vm
+            .cache_module(module.clone(), &mut interpreter_context)
+            .expect("Failure loading stdlib");
     }
+
+    let lbr_ty = TypeTag::Struct(StructTag {
+        address: *account_config::LBR_MODULE.address(),
+        module: account_config::LBR_MODULE.name().to_owned(),
+        name: account_config::LBR_STRUCT_NAME.to_owned(),
+        type_params: vec![],
+    });
 
     // generate the genesis WriteSet
     create_and_initialize_main_accounts(
@@ -169,18 +174,17 @@ pub fn encode_genesis_change_set(
         &gas_schedule,
         &mut interpreter_context,
         &public_key,
-        initial_gas_schedule(&move_vm, &data_cache),
+        &lbr_ty,
     );
     create_and_initialize_validator_and_discovery_set(
         &move_vm,
         &gas_schedule,
         &mut interpreter_context,
-        &nodes,
-        &validator_set,
-        &discovery_set,
+        &validators,
+        &lbr_ty,
     );
     setup_libra_version(&move_vm, &gas_schedule, &mut interpreter_context);
-    setup_publishing_option(
+    setup_vm_config(
         &move_vm,
         &gas_schedule,
         &mut interpreter_context,
@@ -189,7 +193,7 @@ pub fn encode_genesis_change_set(
     reconfigure(&move_vm, &gas_schedule, &mut interpreter_context);
     publish_stdlib(&mut interpreter_context, stdlib_modules);
 
-    verify_genesis_write_set(interpreter_context.events(), &discovery_set);
+    verify_genesis_write_set(interpreter_context.events());
     ChangeSet::new(
         interpreter_context
             .make_write_set()
@@ -199,19 +203,14 @@ pub fn encode_genesis_change_set(
 }
 
 pub fn encode_genesis_transaction(
-    _private_key: &Ed25519PrivateKey,
     public_key: Ed25519PublicKey,
-    nodes: &[NodeConfig],
-    validator_set: ValidatorSet,
-    discovery_set: DiscoverySet,
+    validators: &[ValidatorRegistration],
     stdlib_modules: &[VerifiedModule],
     vm_publishing_option: VMPublishingOption,
 ) -> Transaction {
     Transaction::WaypointWriteSet(encode_genesis_change_set(
         &public_key,
-        nodes,
-        validator_set,
-        discovery_set,
+        validators,
         stdlib_modules,
         vm_publishing_option,
     ))
@@ -223,36 +222,235 @@ fn create_and_initialize_main_accounts(
     gas_schedule: &CostTable,
     interpreter_context: &mut TransactionExecutionContext,
     public_key: &Ed25519PublicKey,
-    initial_gas_schedule: Value,
+    lbr_ty: &TypeTag,
 ) {
     let association_addr = account_config::association_address();
     let mut txn_data = TransactionMetadata::default();
     txn_data.sender = association_addr;
 
-    move_vm
-        .execute_function(
-            &ASSOCIATION_MODULE,
-            &INITIALIZE,
-            &gas_schedule,
-            interpreter_context,
-            &txn_data,
-            vec![],
-            vec![],
-        )
-        .expect("Failure initializing association module");
+    let burn_account_address = account_config::burn_account_address();
+    let mut burn_txn_data = TransactionMetadata::default();
+    burn_txn_data.sender = burn_account_address;
 
-    // create  the LBR module
-    move_vm
-        .execute_function(
-            &LBR_MODULE,
-            &INITIALIZE,
-            &gas_schedule,
-            interpreter_context,
-            &txn_data,
-            vec![],
-            vec![],
-        )
-        .expect("Failure initializing LBR");
+    {
+        // Association module setup
+        move_vm
+            .execute_function(
+                &module("Association"),
+                &name("initialize"),
+                gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![],
+                vec![],
+            )
+            .expect("Unable to register root association account in genesis");
+
+        let add_currency_priv_ty = TypeTag::Struct(StructTag {
+            address: account_config::CORE_CODE_ADDRESS,
+            module: name("Libra"),
+            name: name("AddCurrency"),
+            type_params: vec![],
+        });
+
+        move_vm
+            .execute_function(
+                &module("Association"),
+                &name("apply_for_privilege"),
+                gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![add_currency_priv_ty.clone()],
+                vec![],
+            )
+            .expect("Unable to apply for currency privilege in genesis");
+
+        move_vm
+            .execute_function(
+                &module("Association"),
+                &name("grant_privilege"),
+                gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![add_currency_priv_ty],
+                vec![Value::address(association_addr)],
+            )
+            .expect("Unable to grant currency privilege in genesis");
+    }
+
+    {
+        // Initialize burn account
+
+        move_vm
+            .execute_function(
+                &module("Association"),
+                &name("apply_for_association"),
+                gas_schedule,
+                interpreter_context,
+                &burn_txn_data,
+                vec![],
+                vec![],
+            )
+            .expect("Unable to create burn account - apply_for_association failed in genesis");
+
+        move_vm
+            .execute_function(
+                &module("Association"),
+                &name("grant_association_address"),
+                gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![],
+                vec![Value::address(burn_account_address)],
+            )
+            .expect("Unable to create burn account - grant_association_address failed in genesis");
+    }
+
+    {
+        // Initialize currencies
+        move_vm
+            .execute_function(
+                &module("Event"),
+                &name("initialize"),
+                &gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![],
+                vec![],
+            )
+            .expect("Failure initializing Event module");
+        move_vm
+            .execute_function(
+                &module("Libra"),
+                &name("initialize"),
+                &gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![],
+                vec![],
+            )
+            .expect("Failure initializing Libra module");
+
+        // NB: Order matters
+        let currencies = vec!["Coin1", "Coin2", "LBR"];
+        for currency in currencies.into_iter() {
+            move_vm
+                .execute_function(
+                    &module(currency),
+                    &name("initialize"),
+                    &gas_schedule,
+                    interpreter_context,
+                    &txn_data,
+                    vec![],
+                    vec![],
+                )
+                .unwrap_or_else(|e| panic!("Failure initializing currency {}: {}", currency, e));
+
+            let currency_type = TypeTag::Struct(StructTag {
+                address: account_config::CORE_CODE_ADDRESS,
+                module: name(currency),
+                name: name("T"),
+                type_params: vec![],
+            });
+
+            move_vm
+                .execute_function(
+                    &module("Libra"),
+                    &name("grant_burn_capability_for_sender"),
+                    gas_schedule,
+                    interpreter_context,
+                    &burn_txn_data,
+                    vec![currency_type],
+                    vec![],
+                )
+                .expect(
+                    "Unable to create burn account - grant_burn_capability_for_sender failed in genesis",
+                );
+        }
+    }
+
+    {
+        // Account type initialization
+        let unhosted_type = TypeTag::Struct(StructTag {
+            address: account_config::CORE_CODE_ADDRESS,
+            module: name("Unhosted"),
+            name: name("T"),
+            type_params: vec![],
+        });
+        let empty_type = TypeTag::Struct(StructTag {
+            address: account_config::CORE_CODE_ADDRESS,
+            module: name("Empty"),
+            name: name("T"),
+            type_params: vec![],
+        });
+
+        let account_types = vec![unhosted_type, empty_type];
+        for account_type in account_types.into_iter() {
+            move_vm
+                .execute_function(
+                    &module("AccountType"),
+                    &name("register"),
+                    &gas_schedule,
+                    interpreter_context,
+                    &txn_data,
+                    vec![account_type.clone()],
+                    vec![],
+                )
+                .unwrap_or_else(|_| {
+                    panic!("Failure initializing account type {:#?}", account_type)
+                });
+        }
+        move_vm
+            .execute_function(
+                &module("VASP"),
+                &name("initialize"),
+                &gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![],
+                vec![],
+            )
+            .expect("Failure initializing VASP module");
+    }
+
+    {
+        // Account module setup
+        move_vm
+            .execute_function(
+                &module("AccountTrack"),
+                &name("initialize"),
+                &gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![],
+                vec![],
+            )
+            .expect("Failure initializing account tracking module");
+
+        move_vm
+            .execute_function(
+                &module("LibraAccount"),
+                &name("initialize"),
+                &gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![],
+                vec![],
+            )
+            .expect("Failure initializing Libra account module");
+
+        move_vm
+            .execute_function(
+                &module("Unhosted"),
+                &name("publish_global_limits_definition"),
+                &gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![],
+                vec![],
+            )
+            .expect("Failure publishing limits for unhosted accounts");
+    }
 
     // create the association account
     move_vm
@@ -262,7 +460,7 @@ fn create_and_initialize_main_accounts(
             gas_schedule,
             interpreter_context,
             &txn_data,
-            vec![],
+            vec![lbr_ty.clone()],
             vec![
                 Value::address(association_addr),
                 Value::vector_u8(association_addr.to_vec()),
@@ -275,8 +473,7 @@ fn create_and_initialize_main_accounts(
             )
         });
 
-    // create the transaction fee account
-    let transaction_fee_address = account_config::transaction_fee_address();
+    // create burn account
     move_vm
         .execute_function(
             &account_config::ACCOUNT_MODULE,
@@ -284,18 +481,76 @@ fn create_and_initialize_main_accounts(
             gas_schedule,
             interpreter_context,
             &txn_data,
-            vec![],
+            vec![lbr_ty.clone()],
             vec![
-                Value::address(transaction_fee_address),
-                Value::vector_u8(transaction_fee_address.to_vec()),
+                Value::address(burn_account_address),
+                Value::vector_u8(burn_account_address.to_vec()),
             ],
         )
         .unwrap_or_else(|e| {
             panic!(
-                "Failure creating transaction fee account {:?}: {}",
-                transaction_fee_address, e
+                "Failure creating burn account {:?}: {}",
+                burn_account_address, e
             )
         });
+
+    {
+        // Transaction fee setup
+        let prev_sender = txn_data.sender;
+        // create the transaction fee accounts and addresses
+        let accounts = vec!["Coin1", "Coin2"].into_iter().map(|code| {
+            account_config::type_tag_for_currency_code(
+                account_config::from_currency_code_string(code).unwrap(),
+            )
+        });
+
+        let txn_fee_addr = AccountAddress::from_hex_literal("0xFEE").unwrap();
+        txn_data.sender = txn_fee_addr;
+
+        move_vm
+            .execute_function(
+                &module("LibraAccount"),
+                &name("create_unhosted_account"),
+                &gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![lbr_ty.clone()],
+                vec![
+                    Value::address(txn_fee_addr),
+                    Value::vector_u8(txn_fee_addr.to_vec()),
+                ],
+            )
+            .expect("Failure initializing transaction fee account");
+
+        move_vm
+            .execute_function(
+                &module("TransactionFee"),
+                &name("initialize_transaction_fees"),
+                &gas_schedule,
+                interpreter_context,
+                &txn_data,
+                vec![],
+                vec![],
+            )
+            .expect("Failure initializing transaction fees");
+
+        for type_tag in accounts {
+            // Initialize the account as a transaction fee account
+            move_vm
+                .execute_function(
+                    &module("LibraAccount"),
+                    &name("add_currency"),
+                    &gas_schedule,
+                    interpreter_context,
+                    &txn_data,
+                    vec![type_tag],
+                    vec![],
+                )
+                .expect("Failure initializing transaction fee");
+        }
+
+        txn_data.sender = prev_sender;
+    }
 
     move_vm
         .execute_function(
@@ -344,17 +599,6 @@ fn create_and_initialize_main_accounts(
             vec![],
         )
         .expect("Failure initializing block metadata");
-    move_vm
-        .execute_function(
-            &GAS_SCHEDULE_MODULE,
-            &INITIALIZE,
-            &gas_schedule,
-            interpreter_context,
-            &txn_data,
-            vec![],
-            vec![initial_gas_schedule],
-        )
-        .expect("Failure initializing gas module");
 
     move_vm
         .execute_function(
@@ -363,10 +607,9 @@ fn create_and_initialize_main_accounts(
             &gas_schedule,
             interpreter_context,
             &txn_data,
-            vec![],
+            vec![lbr_ty.clone()],
             vec![
                 Value::address(association_addr),
-                Value::vector_u8(association_addr.to_vec()),
                 Value::u64(ASSOCIATION_INIT_BALANCE),
             ],
         )
@@ -385,10 +628,29 @@ fn create_and_initialize_main_accounts(
         )
         .expect("Failure rotating association key");
 
+    let genesis_auth_key = AuthenticationKey::ed25519(public_key).to_vec();
+    move_vm
+        .execute_function(
+            &account_config::ACCOUNT_MODULE,
+            &ROTATE_AUTHENTICATION_KEY,
+            &gas_schedule,
+            interpreter_context,
+            &burn_txn_data,
+            vec![],
+            vec![Value::vector_u8(genesis_auth_key)],
+        )
+        .expect("Failure rotating burn account key");
+
     // Bump the sequence number for the Association account. If we don't do this and a
     // subsequent transaction (e.g., minting) is sent from the Assocation account, a problem
     // arises: both the genesis transaction and the subsequent transaction have sequence
     // number 0
+    let lbr_ty = TypeTag::Struct(StructTag {
+        address: *account_config::LBR_MODULE.address(),
+        module: account_config::LBR_MODULE.name().to_owned(),
+        name: account_config::LBR_STRUCT_NAME.to_owned(),
+        type_params: vec![],
+    });
     move_vm
         .execute_function(
             &account_config::ACCOUNT_MODULE,
@@ -396,7 +658,7 @@ fn create_and_initialize_main_accounts(
             &gas_schedule,
             interpreter_context,
             &txn_data,
-            vec![],
+            vec![lbr_ty],
             vec![
                 Value::u64(/* txn_sequence_number */ 0),
                 Value::u64(/* txn_gas_price */ 0),
@@ -405,19 +667,6 @@ fn create_and_initialize_main_accounts(
             ],
         )
         .expect("Failure running epilogue for association account");
-
-    txn_data.sender = account_config::transaction_fee_address();
-    move_vm
-        .execute_function(
-            &TRANSACTION_FEE_MODULE,
-            &INITIALIZE_TXN_FEES,
-            &gas_schedule,
-            interpreter_context,
-            &txn_data,
-            vec![],
-            vec![],
-        )
-        .expect("Failure initializing transaction fee");
 }
 
 /// Create and initialize validator and discovery set.
@@ -425,19 +674,17 @@ fn create_and_initialize_validator_and_discovery_set(
     move_vm: &MoveVM,
     gas_schedule: &CostTable,
     interpreter_context: &mut TransactionExecutionContext,
-    nodes: &[NodeConfig],
-    validator_set: &ValidatorSet,
-    discovery_set: &DiscoverySet,
+    validators: &[ValidatorRegistration],
+    lbr_ty: &TypeTag,
 ) {
-    create_and_initialize_validator_set(move_vm, gas_schedule, interpreter_context);
-    create_and_initialize_discovery_set(move_vm, gas_schedule, interpreter_context);
+    create_and_initialize_validator_set(move_vm, gas_schedule, interpreter_context, lbr_ty);
+    create_and_initialize_discovery_set(move_vm, gas_schedule, interpreter_context, lbr_ty);
     initialize_validators(
         move_vm,
         gas_schedule,
         interpreter_context,
-        nodes,
-        validator_set,
-        discovery_set,
+        &validators,
+        lbr_ty,
     );
 }
 
@@ -446,6 +693,7 @@ fn create_and_initialize_validator_set(
     move_vm: &MoveVM,
     gas_schedule: &CostTable,
     interpreter_context: &mut TransactionExecutionContext,
+    lbr_ty: &TypeTag,
 ) {
     let mut txn_data = TransactionMetadata::default();
     let validator_set_address = account_config::validator_set_address();
@@ -458,7 +706,7 @@ fn create_and_initialize_validator_set(
             gas_schedule,
             interpreter_context,
             &txn_data,
-            vec![],
+            vec![lbr_ty.clone()],
             vec![
                 Value::address(validator_set_address),
                 Value::vector_u8(validator_set_address.to_vec()),
@@ -489,6 +737,7 @@ fn create_and_initialize_discovery_set(
     move_vm: &MoveVM,
     gas_schedule: &CostTable,
     interpreter_context: &mut TransactionExecutionContext,
+    lbr_ty: &TypeTag,
 ) {
     let mut txn_data = TransactionMetadata::default();
     let discovery_set_address = account_config::discovery_set_address();
@@ -501,7 +750,7 @@ fn create_and_initialize_discovery_set(
             gas_schedule,
             interpreter_context,
             &txn_data,
-            vec![],
+            vec![lbr_ty.clone()],
             vec![
                 Value::address(discovery_set_address),
                 Value::vector_u8(discovery_set_address.to_vec()),
@@ -527,54 +776,22 @@ fn create_and_initialize_discovery_set(
         .expect("Failure initializing discovery set");
 }
 
-// TODO: refactor ValidatorSet / NodeConfig to make it possible to  do this resolution without a
-// linear search through nodes
-/// Return an authentication key in `nodes` whose derived address is equal to `address`
-fn get_validator_authentication_key(
-    nodes: &[NodeConfig],
-    address: &AccountAddress,
-) -> Option<AuthenticationKey> {
-    for node in nodes {
-        let public_key = node
-            .test
-            .as_ref()
-            .unwrap()
-            .account_keypair
-            .as_ref()
-            .unwrap()
-            .public();
-        let validator_authentication_key = AuthenticationKey::ed25519(public_key);
-        let derived_address = validator_authentication_key.derived_address();
-        if derived_address == *address {
-            return Some(validator_authentication_key);
-        }
-    }
-    None
-}
-
 /// Initialize each validator.
 fn initialize_validators(
     move_vm: &MoveVM,
     gas_schedule: &CostTable,
     interpreter_context: &mut TransactionExecutionContext,
-    nodes: &[NodeConfig],
-    validator_set: &ValidatorSet,
-    discovery_set: &DiscoverySet,
+    validators: &[ValidatorRegistration],
+    lbr_ty: &TypeTag,
 ) {
     let mut txn_data = TransactionMetadata::default();
     txn_data.sender = account_config::association_address();
 
-    for (validator_keys, discovery_info) in validator_set.payload().iter().zip(discovery_set.iter())
-    {
-        // First, add a ValidatorConfig resource under each account
-        let validator_address = *validator_keys.account_address();
-        let validator_authentication_key =
-            get_validator_authentication_key(nodes, &validator_address).unwrap_or_else(|| {
-                panic!(
-                    "Couldn't find authentication key for validator address {}",
-                    validator_address
-                )
-            });
+    for (account_key, registration) in validators {
+        let auth_key = AuthenticationKey::ed25519(&account_key);
+        let account = auth_key.derived_address();
+
+        // Create an account
         move_vm
             .execute_function(
                 &account_config::ACCOUNT_MODULE,
@@ -582,51 +799,29 @@ fn initialize_validators(
                 gas_schedule,
                 interpreter_context,
                 &txn_data,
-                vec![],
+                vec![lbr_ty.clone()],
                 vec![
-                    Value::address(validator_address),
-                    Value::vector_u8(validator_authentication_key.prefix().to_vec()),
+                    Value::address(account),
+                    Value::vector_u8(auth_key.prefix().to_vec()),
                 ],
             )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failure creating validator account {:?}: {}",
-                    validator_address, e
-                )
-            });
+            .unwrap_or_else(|e| panic!("Failure creating validator account {:?}: {}", account, e));
 
+        // Add the validator information
         let mut validator_txn_data = TransactionMetadata::default();
-        validator_txn_data.sender = validator_address;
+        validator_txn_data.sender = account;
         move_vm
-            .execute_function(
-                &VALIDATOR_CONFIG_MODULE,
-                &REGISTER_CANDIDATE_VALIDATOR,
+            .execute_script(
+                registration.code().to_vec(),
                 &gas_schedule,
                 interpreter_context,
                 &validator_txn_data,
-                vec![],
-                vec![
-                    // consensus_pubkey
-                    Value::vector_u8(validator_keys.consensus_public_key().to_bytes().to_vec()),
-                    // network_signing_pubkey
-                    Value::vector_u8(
-                        validator_keys
-                            .network_signing_public_key()
-                            .to_bytes()
-                            .to_vec(),
-                    ),
-                    // validator_network_identity_pubkey
-                    Value::vector_u8(discovery_info.validator_network_identity_pubkey.to_bytes()),
-                    // validator_network_address
-                    Value::vector_u8(discovery_info.validator_network_address.to_vec()),
-                    // fullnodes_network_identity_pubkey
-                    Value::vector_u8(discovery_info.fullnodes_network_identity_pubkey.to_bytes()),
-                    // fullnodes_network_address
-                    Value::vector_u8(discovery_info.fullnodes_network_address.to_vec()),
-                ],
+                registration.ty_args().to_vec(),
+                convert_txn_args(registration.args()),
             )
-            .unwrap_or_else(|_| panic!("Failure initializing validator {:?}", validator_address));
-        // Then, add the account to the validator set
+            .unwrap_or_else(|_| panic!("Failure initializing validator {:?}", account));
+
+        // Finally, add the account to the validator set
         move_vm
             .execute_function(
                 &LIBRA_SYSTEM_MODULE,
@@ -635,13 +830,13 @@ fn initialize_validators(
                 interpreter_context,
                 &txn_data,
                 vec![],
-                vec![Value::address(validator_address)],
+                vec![Value::address(account)],
             )
-            .unwrap_or_else(|_| panic!("Failure adding validator {:?}", validator_address));
+            .unwrap_or_else(|_| panic!("Failure adding validator {:?}", account));
     }
 }
 
-fn setup_publishing_option(
+fn setup_vm_config(
     move_vm: &MoveVM,
     gas_schedule: &CostTable,
     interpreter_context: &mut TransactionExecutionContext,
@@ -654,13 +849,17 @@ fn setup_publishing_option(
         lcs::to_bytes(&publishing_option).expect("Cannot serialize publishing option");
     move_vm
         .execute_function(
-            &SCRIPT_WHITELIST_MODULE,
+            &VM_CONFIG_MODULE,
             &INITIALIZE,
             &gas_schedule,
             interpreter_context,
             &txn_data,
             vec![],
-            vec![Value::vector_u8(option_bytes)],
+            vec![
+                Value::vector_u8(option_bytes),
+                Value::vector_u8(INITIAL_GAS_SCHEDULE.0.clone()),
+                Value::vector_u8(INITIAL_GAS_SCHEDULE.1.clone()),
+            ],
         )
         .expect("Failure setting up publishing option");
 }
@@ -744,7 +943,7 @@ fn reconfigure(
 }
 
 /// Verify the consistency of the genesis `WriteSet`
-fn verify_genesis_write_set(events: &[ContractEvent], discovery_set: &DiscoverySet) {
+fn verify_genesis_write_set(events: &[ContractEvent]) {
     // Sanity checks on emitted events:
     // (1) The genesis tx should emit 4 events: a pair of payment sent/received events for
     // minting to the genesis address, a ValidatorSetChangeEvent, and a
@@ -773,52 +972,46 @@ fn verify_genesis_write_set(events: &[ContractEvent], discovery_set: &DiscoveryS
         "Expected sequence number 0 for validator set change event but got {}",
         new_epoch_event.sequence_number()
     );
-
-    // (4) The fourth event should be the discovery set change event
-    let discovery_set_change_event = &events[3];
-    assert_eq!(
-        *discovery_set_change_event.key(),
-        DiscoverySet::change_event_key(),
-        "Key of emitted event {:?} does not match change event key {:?}",
-        *discovery_set_change_event.key(),
-        DiscoverySet::change_event_key()
-    );
-    // (5) This should be the first discovery set change event
-    assert_eq!(
-        discovery_set_change_event.sequence_number(),
-        0,
-        "Expected sequence number 0 for discovery set change event but got {}",
-        discovery_set_change_event.sequence_number()
-    );
-    // (6) It should emit the discovery set we fed into the genesis tx
-    assert_eq!(
-        &DiscoverySet::from_bytes(discovery_set_change_event.event_data()).unwrap(),
-        discovery_set,
-        "Discovery set in emitted event does not match discovery set fed into genesis transaction",
-    );
 }
 
 /// Generate an artificial genesis `ChangeSet` for testing
 pub fn generate_genesis_change_set_for_testing(stdlib_options: StdLibOptions) -> ChangeSet {
     let stdlib_modules = stdlib_modules(stdlib_options);
-    let swarm = generator::validator_swarm_for_testing(10);
+    let swarm = libra_config::generator::validator_swarm_for_testing(10);
 
     encode_genesis_change_set(
         &GENESIS_KEYPAIR.1,
-        &swarm.nodes,
-        swarm.validator_set,
-        swarm.discovery_set,
+        &validator_registrations(&swarm.nodes),
         stdlib_modules,
         VMPublishingOption::Open,
     )
 }
 
 // `StateView` has no data given we are creating the genesis
-struct GenesisStateView;
+struct GenesisStateView {
+    data: HashMap<AccessPath, Vec<u8>>,
+}
+
+impl GenesisStateView {
+    fn new() -> Self {
+        Self {
+            data: HashMap::new(),
+        }
+    }
+
+    fn add_module(&mut self, module_id: &ModuleId, module: &VerifiedModule) {
+        let access_path = AccessPath::from(module_id);
+        let mut blob = vec![];
+        module
+            .serialize(&mut blob)
+            .expect("serializing stdlib must work");
+        self.data.insert(access_path, blob);
+    }
+}
 
 impl StateView for GenesisStateView {
-    fn get(&self, _access_path: &AccessPath) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+    fn get(&self, access_path: &AccessPath) -> Result<Option<Vec<u8>>> {
+        Ok(self.data.get(access_path).cloned())
     }
 
     fn multi_get(&self, _access_paths: &[AccessPath]) -> Result<Vec<Option<Vec<u8>>>> {
@@ -828,4 +1021,42 @@ impl StateView for GenesisStateView {
     fn is_genesis(&self) -> bool {
         true
     }
+}
+
+pub fn validator_registrations(node_configs: &[NodeConfig]) -> Vec<ValidatorRegistration> {
+    node_configs
+        .iter()
+        .map(|n| {
+            let test = n.test.as_ref().unwrap();
+            let account_key = test.account_keypair.as_ref().unwrap().public_key();
+            let consensus_key = test.consensus_keypair.as_ref().unwrap().public_key();
+            let network = n.validator_network.as_ref().unwrap();
+            let network_keypairs = network.network_keypairs.as_ref().unwrap();
+            let signing_key = network_keypairs.signing_keypair.public_key();
+            let raw_advertised_address =
+                RawNetworkAddress::try_from(&network.advertised_address).unwrap();
+
+            let script = transaction_builder::encode_register_validator_script(
+                consensus_key.to_bytes().to_vec(),
+                signing_key.to_bytes().to_vec(),
+                network_keypairs.identity_keypair.public_key().to_bytes(),
+                raw_advertised_address.clone().into(),
+                network_keypairs.identity_keypair.public_key().to_bytes(),
+                raw_advertised_address.into(),
+            );
+            (account_key, script)
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Convert the transaction arguments into move values.
+fn convert_txn_args(args: &[TransactionArgument]) -> Vec<Value> {
+    args.iter()
+        .map(|arg| match arg {
+            TransactionArgument::U64(i) => Value::u64(*i),
+            TransactionArgument::Address(a) => Value::address(*a),
+            TransactionArgument::Bool(b) => Value::bool(*b),
+            TransactionArgument::U8Vector(v) => Value::vector_u8(v.clone()),
+        })
+        .collect()
 }

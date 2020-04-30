@@ -35,9 +35,9 @@ use libra_crypto::{
 };
 use libra_logger::prelude::*;
 use libra_metrics::IntCounterVec;
+use libra_network_address::NetworkAddress;
 use libra_types::PeerId;
 use netcore::transport::Transport;
-use parity_multiaddr::Multiaddr;
 use std::{
     clone::Clone,
     collections::HashMap,
@@ -85,10 +85,10 @@ pub enum TransportType {
 pub struct NetworkBuilder {
     executor: Handle,
     peer_id: PeerId,
-    addr: Multiaddr,
+    addr: NetworkAddress,
     role: RoleType,
-    advertised_address: Option<Multiaddr>,
-    seed_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    advertised_address: Option<NetworkAddress>,
+    seed_peers: HashMap<PeerId, Vec<NetworkAddress>>,
     trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
     transport: TransportType,
     channel_size: usize,
@@ -113,7 +113,7 @@ pub struct NetworkBuilder {
     max_concurrent_network_reqs: usize,
     max_concurrent_network_notifs: usize,
     max_connection_delay_ms: u64,
-    signing_keys: Option<(Ed25519PrivateKey, Ed25519PublicKey)>,
+    signing_keypair: Option<(Ed25519PrivateKey, Ed25519PublicKey)>,
     enable_remote_authentication: bool,
 }
 
@@ -122,7 +122,7 @@ impl NetworkBuilder {
     pub fn new(
         executor: Handle,
         peer_id: PeerId,
-        addr: Multiaddr,
+        addr: NetworkAddress,
         role: RoleType,
     ) -> NetworkBuilder {
         // Setup channel to send requests to peer manager.
@@ -167,7 +167,7 @@ impl NetworkBuilder {
             max_concurrent_network_reqs: MAX_CONCURRENT_NETWORK_REQS,
             max_concurrent_network_notifs: MAX_CONCURRENT_NETWORK_NOTIFS,
             max_connection_delay_ms: MAX_CONNECTION_DELAY_MS,
-            signing_keys: None,
+            signing_keypair: None,
             enable_remote_authentication: true,
         }
     }
@@ -179,7 +179,7 @@ impl NetworkBuilder {
     }
 
     /// Set and address to advertise, if different from the listen address
-    pub fn advertised_address(&mut self, advertised_address: Multiaddr) -> &mut Self {
+    pub fn advertised_address(&mut self, advertised_address: NetworkAddress) -> &mut Self {
         self.advertised_address = Some(advertised_address);
         self
     }
@@ -194,13 +194,13 @@ impl NetworkBuilder {
     }
 
     /// Set signing keys of local node.
-    pub fn signing_keys(&mut self, keys: (Ed25519PrivateKey, Ed25519PublicKey)) -> &mut Self {
-        self.signing_keys = Some(keys);
+    pub fn signing_keypair(&mut self, keypair: (Ed25519PrivateKey, Ed25519PublicKey)) -> &mut Self {
+        self.signing_keypair = Some(keypair);
         self
     }
 
     /// Set seed peers to bootstrap discovery
-    pub fn seed_peers(&mut self, seed_peers: HashMap<PeerId, Vec<Multiaddr>>) -> &mut Self {
+    pub fn seed_peers(&mut self, seed_peers: HashMap<PeerId, Vec<NetworkAddress>>) -> &mut Self {
         self.seed_peers = seed_peers;
         self
     }
@@ -351,15 +351,21 @@ impl NetworkBuilder {
         rx
     }
 
-    pub fn add_discovery(&mut self) -> &mut Self {
-        // We start the connectivity_manager module only if the network is
-        // permissioned.
-        // Initialize and start connectivity manager.
+    /// Add a [`ConnectivityManager`] to the network.
+    ///
+    /// [`ConnectivityManager`] is responsible for ensuring that we are connected
+    /// to a node iff. it is an eligible node and maintaining persistent
+    /// connections with all eligible nodes. A list of eligible nodes is received
+    /// at initialization, and updates are received on changes to system membership.
+    ///
+    /// Note: a connectivity manager should only be added if the network is
+    /// permissioned.
+    pub fn add_connectivity_manager(&mut self) -> &mut Self {
         let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new(
             self.channel_size,
             &counters::PENDING_CONNECTIVITY_MANAGER_REQUESTS,
         );
-        self.conn_mgr_reqs_tx = Some(conn_mgr_reqs_tx.clone());
+        self.conn_mgr_reqs_tx = Some(conn_mgr_reqs_tx);
         let peer_id = self.peer_id;
         let trusted_peers = self.trusted_peers.clone();
         let seed_peers = self.seed_peers.clone();
@@ -380,13 +386,24 @@ impl NetworkBuilder {
             )
         });
         self.executor.spawn(conn_mgr.start());
+        self
+    }
 
-        // We start the discovery module only if the network is permissioned.
-        // Note: We use the `enable_remote_authentication` flag as a proxy for whether we need to run the
-        // discovery module or not. We should make this more explicit eventually.
-        // Initialize and start Discovery actor.
+    /// Add the (gossip) [`Discovery`] protocol to the network.
+    ///
+    /// (gossip) [`Discovery`] discovers other eligible peers' network addresses
+    /// by exchanging the full set of known peer network addresses with connected
+    /// peers as a network protocol.
+    pub fn add_gossip_discovery(&mut self) -> &mut Self {
+        // Note: We use the `enable_remote_authentication` flag as a proxy for
+        // whether we need to run the discovery module or not. We should make this
+        // more explicit eventually.
+        let peer_id = self.peer_id;
+        let conn_mgr_reqs_tx = self
+            .conn_mgr_reqs_tx()
+            .expect("ConnectivityManager not enabled");
         let (signing_private_key, _signing_public_key) =
-            self.signing_keys.take().expect("Signing keys not set");
+            self.signing_keypair.take().expect("Signing keys not set");
         // Get handles for network events and sender.
         let (discovery_network_tx, discovery_network_rx) = discovery::add_to_network(self);
         let addrs = vec![self
@@ -435,8 +452,8 @@ impl NetworkBuilder {
     }
 
     /// Create the configured transport and start PeerManager.
-    /// Return the actual Multiaddr over which this peer is listening.
-    pub fn build(mut self) -> Multiaddr {
+    /// Return the actual NetworkAddress over which this peer is listening.
+    pub fn build(mut self) -> NetworkAddress {
         let peer_id = self.peer_id;
         let supported_protocols = self.supported_protocols();
         // Build network based on the transport type
@@ -482,8 +499,8 @@ impl NetworkBuilder {
     }
 
     /// Given a transport build and launch PeerManager.
-    /// Return the actual Multiaddr over which this peer is listening.
-    fn build_with_transport<TTransport, TSocket>(self, transport: TTransport) -> Multiaddr
+    /// Return the actual NetworkAddress over which this peer is listening.
+    fn build_with_transport<TTransport, TSocket>(self, transport: TTransport) -> NetworkAddress
     where
         TTransport: Transport<Output = Connection<TSocket>> + Send + 'static,
         TSocket: transport::TSocket,

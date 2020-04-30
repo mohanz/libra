@@ -5,7 +5,7 @@ use crate::{
     annotations::Annotations,
     function_target::FunctionTargetData,
     stackless_bytecode::{
-        AssignKind, AttrId, BranchCond,
+        AssignKind, AttrId,
         Bytecode::{self},
         Constant, Label, Operation, SpecBlockId, TempIndex,
     },
@@ -22,7 +22,6 @@ use vm::{
     access::ModuleAccess,
     file_format::{
         Bytecode as MoveBytecode, CodeOffset, CompiledModule, FieldHandleIndex, SignatureIndex,
-        SignatureToken,
     },
     views::{FunctionHandleView, ViewInternals},
 };
@@ -58,7 +57,7 @@ impl<'a> StacklessBytecodeGenerator<'a> {
         let mut label_map = BTreeMap::new();
 
         // Generate labels.
-        for bytecode in original_code {
+        for (pos, bytecode) in original_code.iter().enumerate() {
             if let MoveBytecode::BrTrue(code_offset)
             | MoveBytecode::BrFalse(code_offset)
             | MoveBytecode::Branch(code_offset) = bytecode
@@ -66,6 +65,10 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                 let label = Label::new(label_map.len());
                 label_map.insert(*code_offset as CodeOffset, label);
             }
+            if let MoveBytecode::BrTrue(_) | MoveBytecode::BrFalse(_) = bytecode {
+                let fall_through_label = Label::new(label_map.len());
+                label_map.insert((pos + 1) as CodeOffset, fall_through_label);
+            };
         }
         // Generate bytecode.
         let mut given_spec_blocks = BTreeMap::new();
@@ -126,18 +129,14 @@ impl<'a> StacklessBytecodeGenerator<'a> {
         }
 
         // Add spec block if defined at this code offset.
-        if self
-            .func_env
-            .get_specification_on_impl(code_offset)
-            .is_some()
-        {
+        if self.func_env.get_spec().on_impl.get(&code_offset).is_some() {
             let block_id = SpecBlockId::new(spec_blocks.len());
             spec_blocks.insert(block_id, code_offset);
             let spec_block_attr_id = self.new_loc_attr(code_offset);
             self.code
                 .push(Bytecode::SpecBlock(spec_block_attr_id, block_id));
 
-            // If the current instruction is just a Nop, skip it. It has been generated tp support
+            // If the current instruction is just a Nop, skip it. It has been generated to support
             // spec blocks.
             if matches!(bytecode, MoveBytecode::Nop) {
                 return;
@@ -167,7 +166,8 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                 self.code.push(Bytecode::Branch(
                     attr_id,
                     *label_map.get(target).unwrap(),
-                    BranchCond::True(temp_index),
+                    *label_map.get(&(code_offset + 1)).unwrap(),
+                    temp_index,
                 ));
             }
 
@@ -175,8 +175,9 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                 let temp_index = self.temp_stack.pop().unwrap();
                 self.code.push(Bytecode::Branch(
                     attr_id,
+                    *label_map.get(&(code_offset + 1)).unwrap(),
                     *label_map.get(target).unwrap(),
-                    BranchCond::False(temp_index),
+                    temp_index,
                 ));
             }
 
@@ -207,11 +208,8 @@ impl<'a> StacklessBytecodeGenerator<'a> {
             }
 
             MoveBytecode::Branch(target) => {
-                self.code.push(Bytecode::Branch(
-                    attr_id,
-                    *label_map.get(target).unwrap(),
-                    BranchCond::Always,
-                ));
+                self.code
+                    .push(Bytecode::Jump(attr_id, *label_map.get(target).unwrap()));
             }
 
             MoveBytecode::FreezeRef => {
@@ -623,10 +621,10 @@ impl<'a> StacklessBytecodeGenerator<'a> {
             MoveBytecode::WriteRef => {
                 let ref_operand_index = self.temp_stack.pop().unwrap();
                 let val_operand_index = self.temp_stack.pop().unwrap();
-                self.code.push(mk_unary(
+                self.code.push(mk_call(
                     Operation::WriteRef,
-                    ref_operand_index,
-                    val_operand_index,
+                    vec![],
+                    vec![ref_operand_index, val_operand_index],
                 ));
             }
 
@@ -879,15 +877,16 @@ impl<'a> StacklessBytecodeGenerator<'a> {
             }
 
             MoveBytecode::MutBorrowGlobal(idx) | MoveBytecode::ImmBorrowGlobal(idx) => {
-                let struct_definition = self.module.struct_def_at(*idx);
+                let struct_env = self.func_env.module_env.get_struct_by_def_idx(*idx);
                 let is_mut = matches!(bytecode, MoveBytecode::MutBorrowGlobal(..));
-
                 let operand_index = self.temp_stack.pop().unwrap();
                 let temp_index = self.temp_count;
                 self.local_types.push(Type::Reference(
                     is_mut,
-                    Box::new(self.func_env.module_env.globalize_signature(
-                        &SignatureToken::Struct(struct_definition.struct_handle),
+                    Box::new(Type::Struct(
+                        struct_env.module_env.get_id(),
+                        struct_env.get_id(),
+                        vec![],
                     )),
                 ));
                 self.temp_stack.push(temp_index);
@@ -906,22 +905,22 @@ impl<'a> StacklessBytecodeGenerator<'a> {
             MoveBytecode::MutBorrowGlobalGeneric(idx)
             | MoveBytecode::ImmBorrowGlobalGeneric(idx) => {
                 let struct_instantiation = self.module.struct_instantiation_at(*idx);
-                let struct_definition = self.module.struct_def_at(struct_instantiation.def);
                 let is_mut = matches!(bytecode, MoveBytecode::MutBorrowGlobalGeneric(..));
+                let struct_env = self
+                    .func_env
+                    .module_env
+                    .get_struct_by_def_idx(struct_instantiation.def);
 
                 let operand_index = self.temp_stack.pop().unwrap();
                 let temp_index = self.temp_count;
                 let actuals = self.get_type_params(struct_instantiation.type_parameters);
                 self.local_types.push(Type::Reference(
                     is_mut,
-                    Box::new(
-                        self.func_env
-                            .module_env
-                            .globalize_signature(&SignatureToken::Struct(
-                                struct_definition.struct_handle,
-                            ))
-                            .instantiate(&actuals),
-                    ),
+                    Box::new(Type::Struct(
+                        struct_env.module_env.get_id(),
+                        struct_env.get_id(),
+                        actuals.clone(),
+                    )),
                 ));
                 self.temp_stack.push(temp_index);
                 self.temp_count += 1;
@@ -939,17 +938,15 @@ impl<'a> StacklessBytecodeGenerator<'a> {
             }
 
             MoveBytecode::MoveFrom(idx) => {
-                let struct_definition = self.module.struct_def_at(*idx);
+                let struct_env = self.func_env.module_env.get_struct_by_def_idx(*idx);
                 let operand_index = self.temp_stack.pop().unwrap();
                 let temp_index = self.temp_count;
                 self.temp_stack.push(temp_index);
-                self.local_types.push(
-                    self.func_env
-                        .module_env
-                        .globalize_signature(&SignatureToken::Struct(
-                            struct_definition.struct_handle,
-                        )),
-                );
+                self.local_types.push(Type::Struct(
+                    struct_env.module_env.get_id(),
+                    struct_env.get_id(),
+                    vec![],
+                ));
                 self.temp_count += 1;
                 self.code.push(mk_unary(
                     Operation::MoveFrom(
@@ -964,19 +961,19 @@ impl<'a> StacklessBytecodeGenerator<'a> {
 
             MoveBytecode::MoveFromGeneric(idx) => {
                 let struct_instantiation = self.module.struct_instantiation_at(*idx);
-                let struct_definition = self.module.struct_def_at(struct_instantiation.def);
+                let struct_env = self
+                    .func_env
+                    .module_env
+                    .get_struct_by_def_idx(struct_instantiation.def);
                 let operand_index = self.temp_stack.pop().unwrap();
                 let temp_index = self.temp_count;
                 self.temp_stack.push(temp_index);
                 let actuals = self.get_type_params(struct_instantiation.type_parameters);
-                self.local_types.push(
-                    self.func_env
-                        .module_env
-                        .globalize_signature(&SignatureToken::Struct(
-                            struct_definition.struct_handle,
-                        ))
-                        .instantiate(&actuals),
-                );
+                self.local_types.push(Type::Struct(
+                    struct_env.module_env.get_id(),
+                    struct_env.get_id(),
+                    actuals.clone(),
+                ));
                 self.temp_count += 1;
                 self.code.push(mk_unary(
                     Operation::MoveFrom(

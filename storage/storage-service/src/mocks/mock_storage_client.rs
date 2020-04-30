@@ -9,8 +9,10 @@ use libra_crypto::{ed25519::Ed25519PrivateKey, HashValue, PrivateKey, Uniform};
 use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
+    account_config::{from_currency_code_string, AccountResource, LBR_NAME},
     account_state::AccountState,
     account_state_blob::AccountStateBlob,
+    epoch_change::EpochChangeProof,
     event::EventHandle,
     get_with_proof::{RequestItem, ResponseItem},
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
@@ -25,7 +27,6 @@ use libra_types::{
     },
     test_helpers::transaction_test_helpers::get_test_signed_txn,
     transaction::{Transaction, Version},
-    validator_change::ValidatorChangeProof,
     vm_error::StatusCode,
 };
 use rand::{
@@ -34,9 +35,9 @@ use rand::{
 };
 use std::{collections::BTreeMap, convert::TryFrom};
 use storage_client::StorageRead;
+use storage_interface::StartupInfo;
 use storage_proto::{
     BackupAccountStateResponse, BackupTransactionInfoResponse, BackupTransactionResponse,
-    StartupInfo,
 };
 
 /// This is a mock of the storage read client used in tests.
@@ -55,7 +56,7 @@ impl StorageRead for MockStorageReadClient {
     ) -> Result<(
         Vec<ResponseItem>,
         LedgerInfoWithSignatures,
-        ValidatorChangeProof,
+        EpochChangeProof,
         AccumulatorConsistencyProof,
     )> {
         let request = libra_types::get_with_proof::UpdateToLatestLedgerRequest::new(
@@ -70,7 +71,7 @@ impl StorageRead for MockStorageReadClient {
         let ret = (
             response.response_items,
             response.ledger_info_with_sigs,
-            response.validator_change_proof,
+            response.epoch_change_proof,
             response.ledger_consistency_proof,
         );
         Ok(ret)
@@ -113,7 +114,7 @@ impl StorageRead for MockStorageReadClient {
         &self,
         _start_epoch: u64,
         _end_epoch: u64,
-    ) -> Result<ValidatorChangeProof> {
+    ) -> Result<EpochChangeProof> {
         unimplemented!()
     }
 
@@ -232,19 +233,20 @@ fn get_mock_response_item(request_item: &ProtoRequestItem) -> Result<ProtoRespon
 }
 
 fn get_mock_account_state_blob() -> AccountStateBlob {
-    let account_resource = libra_types::account_config::AccountResource::new(
+    let account_resource = AccountResource::new(
         0,
         vec![],
         false,
         false,
         EventHandle::random_handle(0),
         EventHandle::random_handle(0),
-        0,
+        false,
+        from_currency_code_string(LBR_NAME).unwrap(),
     );
 
     let mut account_state = AccountState::default();
     account_state.insert(
-        libra_types::account_config::AccountResource::resource_path(),
+        AccountResource::resource_path(),
         lcs::to_bytes(&account_resource).unwrap(),
     );
 
@@ -256,7 +258,7 @@ fn get_mock_txn_data(
     start_seq: u64,
     end_seq: u64,
 ) -> Vec<libra_types::proto::types::Transaction> {
-    let mut seed_rng = OsRng::new().expect("can't access OsRng");
+    let mut seed_rng = OsRng;
     let seed_buf: [u8; 32] = seed_rng.gen();
     let mut rng = StdRng::from_seed(seed_buf);
     let priv_key = Ed25519PrivateKey::generate(&mut rng);

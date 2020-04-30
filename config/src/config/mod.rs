@@ -32,12 +32,16 @@ mod mempool_config;
 pub use mempool_config::*;
 mod network_config;
 pub use network_config::*;
+mod secure_config;
+pub use secure_config::*;
 mod state_sync_config;
 pub use state_sync_config::*;
 mod storage_config;
 pub use storage_config::*;
 mod safety_rules_config;
 pub use safety_rules_config::*;
+mod upstream_config;
+pub use upstream_config::*;
 mod test_config;
 use libra_types::waypoint::Waypoint;
 pub use test_config::*;
@@ -71,11 +75,15 @@ pub struct NodeConfig {
     #[serde(default)]
     pub mempool: MempoolConfig,
     #[serde(default)]
+    pub secure: SecureConfig,
+    #[serde(default)]
     pub state_sync: StateSyncConfig,
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub test: Option<TestConfig>,
+    #[serde(default)]
+    pub upstream: UpstreamConfig,
     #[serde(default)]
     pub validator_network: Option<NetworkConfig>,
 }
@@ -171,32 +179,14 @@ impl NodeConfig {
             metrics: self.metrics.clone(),
             mempool: self.mempool.clone(),
             state_sync: self.state_sync.clone(),
+            secure: self.secure.clone(),
             storage: self.storage.clone(),
             test: None,
+            upstream: self.upstream.clone(),
             validator_network: self
                 .validator_network
                 .as_ref()
                 .map(|n| n.clone_for_template()),
-        }
-    }
-
-    /// Determines whether a node `peer_id` is an upstream peer of a node with this NodeConfig.
-    /// For a validator node, any of its validator peers are considered an upstream peer
-    /// In general, a network ID is a PeerId that this node uses to uniquely identify a network it belongs to.
-    /// This is equivalent to the `peer_id` field in the NetworkConfig of this NodeConfig
-    /// Here, `network_id` is the ID of the network that the peer and this node belong to.
-    pub fn is_upstream_peer(&self, peer_id: PeerId, network_id: PeerId) -> bool {
-        match self.base.role {
-            RoleType::Validator => self
-                .validator_network
-                .as_ref()
-                .map(|cfg| cfg.peer_id == network_id)
-                .unwrap_or_default(),
-            RoleType::FullNode => self
-                .state_sync
-                .upstream_peers
-                .upstream_peers
-                .contains(&peer_id),
         }
     }
 
@@ -243,15 +233,6 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Returns true if network_config is for an upstream network
-    pub fn is_upstream_network(&self, network_config: &NetworkConfig) -> bool {
-        self.state_sync
-            .upstream_peers
-            .upstream_peers
-            .iter()
-            .any(|peer_id| network_config.network_peers.peers.contains_key(peer_id))
-    }
-
     pub fn randomize_ports(&mut self) {
         self.admission_control.randomize_ports();
         self.debug_interface.randomize_ports();
@@ -281,7 +262,8 @@ impl NodeConfig {
 
         if self.base.role == RoleType::Validator {
             test.random_account_key(rng);
-            let peer_id = PeerId::from_public_key(test.account_keypair.as_ref().unwrap().public());
+            let peer_id =
+                PeerId::from_public_key(&test.account_keypair.as_ref().unwrap().public_key());
 
             if self.validator_network.is_none() {
                 self.validator_network = Some(NetworkConfig::default());

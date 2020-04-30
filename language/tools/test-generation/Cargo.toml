@@ -10,10 +10,10 @@ publish = false
 edition = "2018"
 
 [dependencies]
-rand = "0.6.5"
-num_cpus = "1.11.1"
+rand = "0.7.3"
+num_cpus = "1.13.0"
 mirai-annotations = "1.7.0"
-structopt = "0.3.13"
+structopt = "0.3.14"
 itertools = "0.9.0"
 hex = "0.4.2"
 getrandom = "0.1.13"
@@ -25,7 +25,6 @@ libra-logger = { path = "../../../common/logger", version = "0.1.0" }
 libra-state-view = { path = "../../../storage/state-view", version = "0.1.0" }
 libra-workspace-hack = { path = "../../../common/workspace-hack", version = "0.1.0" }
 move-core-types = { path = "../../move-core/types", version = "0.1.0" }
-move-vm-cache = { path = "../../move-vm/cache", version = "0.1.0" }
 move-vm-types = { path = "../../move-vm/types", version = "0.1.0" }
 utils = { path = "../utils", version = "0.1.0" }
 vm = { path = "../../vm", version = "0.1.0" }

@@ -2,26 +2,54 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    access_path::AccessPath,
+    access_path::{AccessPath, Accesses},
     account_config,
+    contract_event::ContractEvent,
     discovery_info::DiscoveryInfo,
     event::{EventHandle, EventKey},
+    language_storage::{StructTag, TypeTag},
     move_resource::MoveResource,
 };
-use anyhow::Result;
-use move_core_types::identifier::{IdentStr, Identifier};
+use anyhow::{ensure, Error, Result};
+use move_core_types::identifier::Identifier;
 use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::{iter::IntoIterator, ops::Deref, vec};
+use std::{convert::TryFrom, iter::IntoIterator, ops::Deref, vec};
 
-static DISCOVERY_SET_MODULE_NAME: Lazy<Identifier> =
+pub static DISCOVERY_SET_MODULE_NAME: Lazy<Identifier> =
     Lazy::new(|| Identifier::new("LibraSystem").unwrap());
 
-pub fn discovery_set_module_name() -> &'static IdentStr {
-    &*DISCOVERY_SET_MODULE_NAME
-}
+pub static DISCOVERY_SET_STRUCT_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("DiscoverySet").unwrap());
+
+pub static DISCOVERY_SET_CHANGE_EVENT_STRUCT_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("DiscoverySetChangeEvent").unwrap());
+
+pub static DISCOVERY_SET_STRUCT_TAG: Lazy<StructTag> = Lazy::new(|| StructTag {
+    name: DISCOVERY_SET_STRUCT_NAME.clone(),
+    address: account_config::CORE_CODE_ADDRESS,
+    module: DISCOVERY_SET_MODULE_NAME.clone(),
+    type_params: vec![],
+});
+
+pub static DISCOVERY_SET_CHANGE_EVENT_STRUCT_TAG: Lazy<StructTag> = Lazy::new(|| StructTag {
+    name: DISCOVERY_SET_CHANGE_EVENT_STRUCT_NAME.clone(),
+    address: account_config::CORE_CODE_ADDRESS,
+    module: DISCOVERY_SET_MODULE_NAME.clone(),
+    type_params: vec![],
+});
+
+pub static DISCOVERY_SET_TYPE_TAG: Lazy<TypeTag> =
+    Lazy::new(|| TypeTag::Struct(DISCOVERY_SET_STRUCT_TAG.clone()));
+
+pub static DISCOVERY_SET_CHANGE_EVENT_TYPE_TAG: Lazy<TypeTag> =
+    Lazy::new(|| TypeTag::Struct(DISCOVERY_SET_CHANGE_EVENT_STRUCT_TAG.clone()));
+
+/// Path to the DiscoverySet resource.
+pub static DISCOVERY_SET_RESOURCE_PATH: Lazy<Vec<u8>> =
+    Lazy::new(|| AccessPath::resource_access_vec(&*DISCOVERY_SET_STRUCT_TAG, &Accesses::empty()));
 
 /// The path to the discovery set change event handle under a DiscoverSetResource.
 pub static DISCOVERY_SET_CHANGE_EVENT_PATH: Lazy<Vec<u8>> = Lazy::new(|| {
@@ -96,20 +124,47 @@ impl IntoIterator for DiscoverySet {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct DiscoverySetChangeEvent {
+    pub event_seq_num: u64,
+    pub discovery_set: DiscoverySet,
+}
+
+impl TryFrom<&ContractEvent> for DiscoverySetChangeEvent {
+    type Error = Error;
+
+    fn try_from(contract_event: &ContractEvent) -> Result<Self> {
+        let event_seq_num = contract_event.sequence_number();
+
+        ensure!(
+            &*DISCOVERY_SET_CHANGE_EVENT_TYPE_TAG == contract_event.type_tag(),
+            "Failed to deserialize DiscoverySetChangeEvent, unexpected type tag: {:?}, expected: {:?}",
+            contract_event.type_tag(),
+            &*DISCOVERY_SET_CHANGE_EVENT_TYPE_TAG,
+        );
+
+        let discovery_set = DiscoverySet::from_bytes(contract_event.event_data())?;
+
+        Ok(DiscoverySetChangeEvent {
+            event_seq_num,
+            discovery_set,
+        })
+    }
+}
+
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod mock {
     use super::*;
 
     use crate::on_chain_config::ValidatorSet;
-    use libra_crypto::{test_utils::TEST_SEED, x25519};
-    use parity_multiaddr::Multiaddr;
-    use rand::prelude::*;
+    use libra_crypto::{x25519, Uniform};
+    use libra_network_address::{NetworkAddress, RawNetworkAddress};
     use std::str::FromStr;
 
     pub fn mock_discovery_set(validator_set: &ValidatorSet) -> DiscoverySet {
-        let mut rng = StdRng::from_seed(TEST_SEED);
-        let mock_pubkey = x25519::PrivateKey::for_test(&mut rng).public_key();
-        let mock_addr = Multiaddr::from_str("/ip4/127.0.0.1/tcp/1234").unwrap();
+        let mock_pubkey = x25519::PrivateKey::generate_for_testing().public_key();
+        let mock_addr = NetworkAddress::from_str("/ip4/127.0.0.1/tcp/1234").unwrap();
+        let mock_addr = RawNetworkAddress::try_from(&mock_addr).unwrap();
 
         let discovery_set = validator_set
             .payload()

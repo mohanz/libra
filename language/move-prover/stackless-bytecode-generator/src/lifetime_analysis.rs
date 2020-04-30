@@ -3,11 +3,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bytecode_verifier::absint::{AbstractDomain, JoinResult};
 use vm::file_format::CodeOffset;
 
 use crate::{
-    dataflow_analysis::{DataflowAnalysis, StateMap, TransferFunctions},
+    dataflow_analysis::{
+        AbstractDomain, DataflowAnalysis, JoinResult, StateMap, TransferFunctions,
+    },
     function_target::{FunctionTarget, FunctionTargetData},
     function_target_pipeline::{FunctionTargetProcessor, FunctionTargetsHolder},
     stackless_bytecode::{
@@ -15,7 +16,7 @@ use crate::{
         Bytecode::{self, *},
         Operation, TempIndex,
     },
-    stackless_control_flow_graph::StacklessControlFlowGraph,
+    stackless_control_flow_graph::{BlockId, StacklessControlFlowGraph},
 };
 use itertools::Itertools;
 use spec_lang::{env::FunctionEnv, ty::Type};
@@ -49,7 +50,7 @@ impl FunctionTargetProcessor for LifetimeAnalysisProcessor {
             // Native functions have no byte code.
             LifetimeAnnotation(BTreeMap::new())
         } else {
-            let cfg = StacklessControlFlowGraph::new(&data.code);
+            let cfg = StacklessControlFlowGraph::new_forward(&data.code);
             LifetimeAnnotation(LifetimeAnalysis::analyze(
                 &cfg,
                 &data.code,
@@ -306,26 +307,16 @@ impl<'a> LifetimeAnalysis<'a> {
 
     /// Union the set of dead references at each CodeOffset
     fn post_process(
-        state_map: StateMap<LifetimeState>,
+        state_map: StateMap<LifetimeState, ()>,
     ) -> BTreeMap<CodeOffset, BTreeSet<TempIndex>> {
         let mut res = BTreeMap::new();
         for (_, v) in state_map {
-            LifetimeState::dead_ref_join(&mut res, &v.post.dead_refs);
+            LifetimeState::dead_ref_join(&mut res, &v.post.unwrap().dead_refs);
         }
         res
     }
-}
 
-impl<'a> TransferFunctions for LifetimeAnalysis<'a> {
-    type InstrType = Bytecode;
-    type State = LifetimeState;
-
-    fn execute(
-        &mut self,
-        pre: Self::State,
-        instr: &Self::InstrType,
-        idx: CodeOffset,
-    ) -> Self::State {
+    fn execute(&mut self, pre: LifetimeState, instr: &Bytecode, idx: CodeOffset) -> LifetimeState {
         let mut after_state = pre;
 
         match instr {
@@ -387,8 +378,8 @@ impl<'a> TransferFunctions for LifetimeAnalysis<'a> {
                         after_state.borrow_graph.move_local(src);
                     }
                     WriteRef => {
-                        let dst = dsts[0];
-                        after_state.borrow_graph.move_local(dst);
+                        let src = srcs[0];
+                        after_state.borrow_graph.move_local(src);
                     }
                     ReadRef => {
                         let src = srcs[0];
@@ -433,6 +424,26 @@ impl<'a> TransferFunctions for LifetimeAnalysis<'a> {
             .dead_refs
             .insert(idx, after_state.borrow_graph.trim_graph());
         after_state
+    }
+}
+
+impl<'a> TransferFunctions for LifetimeAnalysis<'a> {
+    type State = LifetimeState;
+    type AnalysisError = ();
+
+    fn execute_block(
+        &mut self,
+        block_id: BlockId,
+        pre_state: Self::State,
+        instrs: &[Bytecode],
+        cfg: &StacklessControlFlowGraph,
+    ) -> Result<Self::State, Self::AnalysisError> {
+        let mut state = pre_state;
+        for offset in cfg.instr_indexes(block_id) {
+            let instr = &instrs[offset as usize];
+            state = self.execute(state, instr, offset);
+        }
+        Ok(state)
     }
 }
 

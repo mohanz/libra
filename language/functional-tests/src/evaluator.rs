@@ -25,6 +25,7 @@ use libra_types::{
     vm_error::{StatusCode, VMStatus},
 };
 use mirai_annotations::checked_verify;
+use move_core_types::gas_schedule::{GasAlgebra, GasConstants};
 use std::{
     fmt::{self, Debug},
     str::FromStr,
@@ -33,7 +34,6 @@ use std::{
 use stdlib::{stdlib_modules, StdLibOptions};
 use vm::{
     file_format::{CompiledModule, CompiledScript},
-    gas_schedule::{GasAlgebra, MAXIMUM_NUMBER_OF_GAS_UNITS},
     views::ModuleView,
 };
 
@@ -196,10 +196,13 @@ fn fetch_script_dependencies(
     exec: &mut FakeExecutor,
     script: &CompiledScript,
 ) -> Vec<VerifiedModule> {
-    let module = script.clone().into_module();
-    let idents = ModuleView::new(&module)
-        .module_handles()
-        .map(|handle_view| handle_view.module_id());
+    let inner = script.as_inner();
+    let idents = inner.module_handles.iter().map(|handle| {
+        ModuleId::new(
+            inner.address_identifiers[handle.address.0 as usize],
+            inner.identifiers[handle.name.0 as usize].clone(),
+        )
+    });
     fetch_dependencies(exec, idents)
 }
 
@@ -234,12 +237,9 @@ fn fetch_dependency(exec: &mut FakeExecutor, ident: ModuleId) -> Option<Verified
 pub fn verify_script(
     script: CompiledScript,
     deps: &[VerifiedModule],
-) -> std::result::Result<VerifiedScript, Vec<VMStatus>> {
-    let verified_script = VerifiedScript::new(script).map_err(|(_, errs)| errs)?;
-    let errs = verify_script_dependencies(&verified_script, deps);
-    if !errs.is_empty() {
-        return Err(errs);
-    }
+) -> std::result::Result<VerifiedScript, VMStatus> {
+    let verified_script = VerifiedScript::new(script).map_err(|(_, e)| e)?;
+    verify_script_dependencies(&verified_script, deps)?;
     Ok(verified_script)
 }
 
@@ -247,12 +247,9 @@ pub fn verify_script(
 pub fn verify_module(
     module: CompiledModule,
     deps: &[VerifiedModule],
-) -> std::result::Result<VerifiedModule, Vec<VMStatus>> {
-    let verified_module = VerifiedModule::new(module).map_err(|(_, errs)| errs)?;
-    let errs = verify_module_dependencies(&verified_module, deps);
-    if !errs.is_empty() {
-        return Err(errs);
-    }
+) -> std::result::Result<VerifiedModule, VMStatus> {
+    let verified_module = VerifiedModule::new(module).map_err(|(_, e)| e)?;
+    verify_module_dependencies(&verified_module, deps)?;
     Ok(verified_module)
 }
 
@@ -274,6 +271,18 @@ fn get_transaction_parameters<'a>(
 ) -> TransactionParameters<'a> {
     let account_resource = exec.read_account_resource(config.sender).unwrap();
     let account_balance = exec.read_balance_resource(config.sender).unwrap();
+    let gas_unit_price = config.gas_price.unwrap_or(0);
+    let max_number_of_gas_units = GasConstants::default().maximum_number_of_gas_units;
+    let max_gas_amount = config.max_gas.unwrap_or_else(|| {
+        if gas_unit_price == 0 {
+            max_number_of_gas_units.get()
+        } else {
+            std::cmp::min(
+                max_number_of_gas_units.get(),
+                account_balance.coin() / gas_unit_price,
+            )
+        }
+    });
 
     TransactionParameters {
         sender_addr: *config.sender.address(),
@@ -282,10 +291,8 @@ fn get_transaction_parameters<'a>(
         sequence_number: config
             .sequence_number
             .unwrap_or_else(|| account_resource.sequence_number()),
-        max_gas_amount: config.max_gas.unwrap_or_else(|| {
-            std::cmp::min(MAXIMUM_NUMBER_OF_GAS_UNITS.get(), account_balance.coin())
-        }),
-        gas_unit_price: config.gas_price.unwrap_or(1),
+        max_gas_amount,
+        gas_unit_price,
         // TTL is 86400s. Initial time was set to 0.
         expiration_time: config
             .expiration_time
@@ -447,11 +454,9 @@ fn eval_transaction<TComp: Compiler>(
             let deps = fetch_script_dependencies(exec, &compiled_script);
             let compiled_script = match verify_script(compiled_script, &deps) {
                 Ok(script) => script.into_inner(),
-                Err(errs) => {
-                    for err in errs.into_iter() {
-                        let err: Error = ErrorKind::VerificationError(err).into();
-                        log.append(EvaluationOutput::Error(Box::new(err)));
-                    }
+                Err(err) => {
+                    let err: Error = ErrorKind::VerificationError(err).into();
+                    log.append(EvaluationOutput::Error(Box::new(err)));
                     return Ok(Status::Failure);
                 }
             };
@@ -487,11 +492,9 @@ fn eval_transaction<TComp: Compiler>(
             let deps = fetch_module_dependencies(exec, &compiled_module);
             let compiled_module = match verify_module(compiled_module, &deps) {
                 Ok(module) => module.into_inner(),
-                Err(errs) => {
-                    for err in errs.into_iter() {
-                        let err: Error = ErrorKind::VerificationError(err).into();
-                        log.append(EvaluationOutput::Error(Box::new(err)));
-                    }
+                Err(err) => {
+                    let err: Error = ErrorKind::VerificationError(err).into();
+                    log.append(EvaluationOutput::Error(Box::new(err)));
                     return Ok(Status::Failure);
                 }
             };
@@ -554,7 +557,7 @@ pub fn eval<TComp: Compiler>(
     let mut log = EvaluationLog { outputs: vec![] };
 
     // Set up a fake executor with the genesis block and create the accounts.
-    let mut exec = if config.validator_set.payload().is_empty() {
+    let mut exec = if config.validator_accounts == 0 {
         if compiler.use_staged_genesis() {
             FakeExecutor::from_genesis_file()
         } else {
@@ -570,7 +573,7 @@ pub fn eval<TComp: Compiler>(
                 StdLibOptions::Fresh
             })
             .to_vec(),
-            Some(config.validator_set.clone()),
+            Some(config.validator_accounts),
             VMPublishingOption::Open,
         )
     };

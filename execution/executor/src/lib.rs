@@ -27,6 +27,7 @@ use libra_types::{
     account_state::AccountState,
     account_state_blob::AccountStateBlob,
     contract_event::ContractEvent,
+    epoch_info::EpochInfo,
     ledger_info::LedgerInfoWithSignatures,
     on_chain_config,
     proof::{accumulator::InMemoryAccumulator, definition::LeafCount, SparseMerkleProof},
@@ -46,13 +47,12 @@ use std::{
     marker::PhantomData,
     sync::Arc,
 };
-use storage_client::VerifiedStateView;
-use storage_interface::DbReaderWriter;
+use storage_interface::{state_view::VerifiedStateView, DbReaderWriter, TreeState};
 
 static OP_COUNTERS: Lazy<libra_metrics::OpMetrics> =
     Lazy::new(|| libra_metrics::OpMetrics::new_and_registered("executor"));
 
-pub trait ChunkExecutor {
+pub trait ChunkExecutor: Send {
     /// Verifies the transactions based on the provided proofs and ledger info. If the transactions
     /// are valid, executes them and commits immediately if execution results match the proofs.
     /// Returns a vector of reconfiguration events in the chunk
@@ -67,7 +67,10 @@ pub trait ChunkExecutor {
     ) -> Result<Vec<ContractEvent>>;
 }
 
-pub trait BlockExecutor {
+pub trait BlockExecutor: Send {
+    /// Reset the internal state including cache with newly fetched latest committed block from storage.
+    fn reset(&mut self) -> Result<()>;
+
     /// Executes a block.
     fn execute_block(
         &mut self,
@@ -125,10 +128,20 @@ where
         }
     }
 
-    fn new_on_unbootstrapped_db(db: DbReaderWriter) -> Self {
+    fn reset_cache(&mut self) -> Result<()> {
+        let startup_info = self
+            .db
+            .reader
+            .get_startup_info()?
+            .ok_or_else(|| format_err!("DB not bootstrapped."))?;
+        self.cache = SpeculationCache::new_with_startup_info(startup_info);
+        Ok(())
+    }
+
+    fn new_on_unbootstrapped_db(db: DbReaderWriter, tree_state: TreeState) -> Self {
         Self {
             db,
-            cache: SpeculationCache::new(),
+            cache: SpeculationCache::new_for_db_bootstrapping(tree_state),
             phantom: PhantomData,
         }
     }
@@ -164,18 +177,17 @@ where
                 "Version of a given epoch LI does not match local computation."
             );
             ensure!(
-                epoch_change_li.ledger_info().next_validator_set().is_some(),
+                epoch_change_li.ledger_info().next_epoch_info().is_some(),
                 "Epoch change LI does not carry validator set"
             );
             ensure!(
-                epoch_change_li.ledger_info().next_validator_set()
-                    == new_output.validators().as_ref(),
+                epoch_change_li.ledger_info().next_epoch_info() == new_output.epoch_info().as_ref(),
                 "New validator set of a given epoch LI does not match local computation"
             );
             return Ok(Some(epoch_change_li));
         }
         ensure!(
-            new_output.validators().is_none(),
+            new_output.epoch_info().is_none(),
             "End of epoch chunk based on local computation but no EoE LedgerInfo provided."
         );
         Ok(None)
@@ -232,12 +244,12 @@ where
         // transactions that will be discarded, since they do not go into the transaction
         // accumulator.
         let mut txn_info_hashes = vec![];
-        let mut next_validator_set = None;
+        let mut next_epoch_info = None;
 
         let proof_reader = ProofReader::new(account_to_proof);
         let new_epoch_event_key = on_chain_config::new_epoch_event_key();
         for (vm_output, txn) in itertools::zip_eq(vm_outputs.into_iter(), transactions.iter()) {
-            if next_validator_set.is_some() {
+            if next_epoch_info.is_some() {
                 txn_data.push(TransactionData::new(
                     HashMap::new(),
                     vec![],
@@ -245,12 +257,11 @@ where
                     Arc::clone(&current_state_tree),
                     Arc::new(InMemoryAccumulator::<EventAccumulatorHasher>::default()),
                     0,
-                    0,
                     None,
                 ));
                 continue;
             }
-            let (blobs, state_tree, num_accounts_created) = Self::process_write_set(
+            let (blobs, state_tree) = Self::process_write_set(
                 txn,
                 &mut account_to_state,
                 &proof_reader,
@@ -305,27 +316,39 @@ where
                 Arc::clone(&state_tree),
                 Arc::new(event_tree),
                 vm_output.gas_used(),
-                num_accounts_created,
                 txn_info_hash,
             ));
             current_state_tree = state_tree;
 
             // check for change in validator set
-            next_validator_set = vm_output
+            next_epoch_info = if vm_output
                 .events()
                 .iter()
-                .find(|event| *event.key() == new_epoch_event_key)
-                .map(|_| {
-                    account_to_state
-                        .get(&account_config::validator_set_address())
-                        .map(|state| {
-                            state
-                                .get_validator_set()?
-                                .ok_or_else(|| format_err!("ValidatorSet does not exist"))
-                        })
+                .any(|event| *event.key() == new_epoch_event_key)
+            {
+                let validator_set = account_to_state
+                    .get(&account_config::validator_set_address())
+                    .map(|state| {
+                        state
+                            .get_validator_set()?
+                            .ok_or_else(|| format_err!("ValidatorSet does not exist"))
+                    })
+                    .ok_or_else(|| format_err!("ValidatorSet account does not exist"))??;
+                let configuration = account_to_state
+                    .get(&account_config::association_address())
+                    .map(|state| {
+                        state
+                            .get_configuration_resource()?
+                            .ok_or_else(|| format_err!("Configuration does not exist"))
+                    })
+                    .ok_or_else(|| format_err!("Association account does not exist"))??;
+                Some(EpochInfo {
+                    epoch: configuration.epoch(),
+                    verifier: (&validator_set).into(),
                 })
-                .flatten()
-                .transpose()?;
+            } else {
+                None
+            }
         }
 
         let current_transaction_accumulator =
@@ -336,7 +359,7 @@ where
                 current_state_tree,
                 Arc::new(current_transaction_accumulator),
             ),
-            next_validator_set,
+            next_epoch_info,
         ))
     }
 
@@ -352,10 +375,8 @@ where
     ) -> Result<(
         HashMap<AccountAddress, AccountStateBlob>,
         Arc<SparseMerkleTree>,
-        usize, /* num_account_created */
     )> {
         let mut updated_blobs = HashMap::new();
-        let mut num_accounts_created = 0;
 
         // Find all addresses this transaction touches while processing each write op.
         let mut addrs = HashSet::new();
@@ -364,13 +385,7 @@ where
             let path = access_path.path;
             match account_to_state.entry(address) {
                 hash_map::Entry::Occupied(mut entry) => {
-                    let account_state = entry.get_mut();
-                    // TODO(gzh): we check account creation here for now. Will remove it once we
-                    // have a better way.
-                    if account_state.is_empty() {
-                        num_accounts_created += 1;
-                    }
-                    Self::update_account_state(account_state, path, write_op);
+                    Self::update_account_state(entry.get_mut(), path, write_op);
                 }
                 hash_map::Entry::Vacant(entry) => {
                     // Before writing to an account, VM should always read that account. So we
@@ -416,7 +431,7 @@ where
                 .expect("Failed to update state tree."),
         );
 
-        Ok((updated_blobs, state_tree, num_accounts_created))
+        Ok((updated_blobs, state_tree))
     }
 
     fn update_account_state(account_state: &mut AccountState, path: Vec<u8>, write_op: WriteOp) {
@@ -433,6 +448,34 @@ where
             .filter(|event| *event.key() == new_epoch_event_key)
             .collect()
     }
+
+    fn get_executed_trees(&self, block_id: HashValue) -> Result<ExecutedTrees> {
+        let executed_trees = if block_id == self.cache.committed_block_id() {
+            self.cache.committed_trees().clone()
+        } else {
+            self.cache
+                .get_block(&block_id)?
+                .lock()
+                .unwrap()
+                .output()
+                .executed_trees()
+                .clone()
+        };
+
+        Ok(executed_trees)
+    }
+
+    fn get_executed_state_view<'a>(
+        &self,
+        executed_trees: &'a ExecutedTrees,
+    ) -> VerifiedStateView<'a> {
+        VerifiedStateView::new(
+            Arc::clone(&self.db.reader),
+            self.cache.committed_trees().version(),
+            self.cache.committed_trees().state_root(),
+            executed_trees.state_tree(),
+        )
+    }
 }
 
 impl<V: VMExecutor> ChunkExecutor for Executor<V> {
@@ -445,6 +488,9 @@ impl<V: VMExecutor> ChunkExecutor for Executor<V> {
         // carrying any epoch change LI.
         epoch_change_li: Option<LedgerInfoWithSignatures>,
     ) -> Result<Vec<ContractEvent>> {
+        // Update the cache in executor to be consistent with latest synced state.
+        self.reset_cache()?;
+
         info!(
             "Local synced version: {}. First transaction version in request: {:?}. \
              Number of transactions in request: {}.",
@@ -600,6 +646,11 @@ impl<V: VMExecutor> ChunkExecutor for Executor<V> {
 }
 
 impl<V: VMExecutor> BlockExecutor for Executor<V> {
+    // Reset executor state.
+    fn reset(&mut self) -> Result<()> {
+        self.reset_cache()
+    }
+
     /// Executes a block.
     fn execute_block(
         &mut self,
@@ -607,26 +658,9 @@ impl<V: VMExecutor> BlockExecutor for Executor<V> {
         parent_block_id: HashValue,
     ) -> Result<StateComputeResult> {
         let (block_id, transactions) = block;
-        let parent_block_executed_trees = if parent_block_id == self.cache.committed_block_id() {
-            self.cache.committed_trees().clone()
-        } else {
-            self.cache
-                .get_block(&parent_block_id)?
-                .lock()
-                .unwrap()
-                .output()
-                .executed_trees()
-                .clone()
-        };
-
         let _timer = OP_COUNTERS.timer("block_execute_time_s");
-        // Construct a StateView and pass the transactions to VM.
-        let state_view = VerifiedStateView::new(
-            Arc::clone(&self.db.reader),
-            self.cache.committed_trees().version(),
-            self.cache.committed_trees().state_root(),
-            parent_block_executed_trees.state_tree(),
-        );
+        let parent_block_executed_trees = self.get_executed_trees(parent_block_id)?;
+        let state_view = self.get_executed_state_view(&parent_block_executed_trees);
 
         let vm_outputs = {
             trace_code_block!("executor::execute_block", {"block", block_id});
@@ -689,15 +723,12 @@ impl<V: VMExecutor> BlockExecutor for Executor<V> {
             itertools::zip_eq(block.transactions(), block.output().transaction_data())
         }) {
             if let TransactionStatus::Keep(_) = txn_data.status() {
-                txns_to_keep.push((
-                    TransactionToCommit::new(
-                        txn.clone(),
-                        txn_data.account_blobs().clone(),
-                        txn_data.events().to_vec(),
-                        txn_data.gas_used(),
-                        txn_data.status().vm_status().major_status,
-                    ),
-                    txn_data.num_account_created(),
+                txns_to_keep.push(TransactionToCommit::new(
+                    txn.clone(),
+                    txn_data.account_blobs().clone(),
+                    txn_data.events().to_vec(),
+                    txn_data.gas_used(),
+                    txn_data.status().vm_status().major_status,
                 ));
             }
         }
@@ -748,10 +779,7 @@ impl<V: VMExecutor> BlockExecutor for Executor<V> {
         }
 
         // Skip duplicate txns that are already persistent.
-        let (txns_to_commit, list_num_account_created): (Vec<_>, Vec<_>) = txns_to_keep
-            .into_iter()
-            .skip(num_txns_to_skip as usize)
-            .unzip();
+        let txns_to_commit = &txns_to_keep[num_txns_to_skip as usize..];
 
         let num_txns_to_commit = txns_to_commit.len() as u64;
         {
@@ -759,13 +787,11 @@ impl<V: VMExecutor> BlockExecutor for Executor<V> {
             OP_COUNTERS.observe("storage_save_transactions.count", num_txns_to_commit as f64);
             assert_eq!(first_version_to_commit, version + 1 - num_txns_to_commit);
             self.db.writer.save_transactions(
-                &txns_to_commit,
+                txns_to_commit,
                 first_version_to_commit,
                 Some(&ledger_info_with_sigs),
             )?;
         }
-        // Only bump the counter when the commit succeeds.
-        OP_COUNTERS.inc_by("num_accounts", list_num_account_created.into_iter().sum());
 
         // Prune the tree.
         for block in blocks {

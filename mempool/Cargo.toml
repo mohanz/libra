@@ -11,17 +11,15 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0"
-chrono = "0.4.11"
 futures = "0.3.0"
 once_cell = "1.3.1"
-lru-cache = "0.1.1"
-prost = "0.6"
+rand = { version = "0.7.3", default-features = false }
 serde = { version = "1.0.106", default-features = false }
 tokio = { version = "0.2.13", features = ["full"] }
-ttl_cache = "0.5.1"
 
 bounded-executor = { path = "../common/bounded-executor", version = "0.1.0" }
 channel = { path = "../common/channel", version = "0.1.0" }
+debug-interface = { path = "../common/debug-interface", version = "0.1.0" }
 lcs = { path = "../common/lcs", version = "0.1.0", package = "libra-canonical-serialization" }
 libra-config = { path = "../config", version = "0.1.0" }
 libra-crypto = { path = "../crypto/crypto", version = "0.1.0" }
@@ -32,23 +30,19 @@ libra-types = { path = "../types", version = "0.1.0" }
 libra-workspace-hack = { path = "../common/workspace-hack", version = "0.1.0" }
 mirai-annotations = "1.7.0"
 network = { path = "../network", version = "0.1.0" }
-prometheus = { version = "0.8.0", default-features = false }
-storage-client = { path = "../storage/storage-client", version = "0.1.0" }
-vm-validator = { path = "../vm-validator", version = "0.1.0" }
-debug-interface = { path = "../common/debug-interface", version = "0.1.0" }
 serde_json = "1.0"
+storage-interface = { path = "../storage/storage-interface", version = "0.1.0" }
+vm-validator = { path = "../vm-validator", version = "0.1.0" }
 
 libra-proptest-helpers = { path = "../common/proptest-helpers", optional = true }
 proptest = { version = "0.9.6", optional = true }
+
 storage-service = { path = "../storage/storage-service", version = "0.1.0", optional = true }
 
 [dev-dependencies]
-parity-multiaddr = { version = "0.8.0", default-features = false }
-rand = "0.6.5"
-
-[build-dependencies]
-tonic-build = "0.2"
+libra-network-address = { path = "../network/network-address", version = "0.1.0" }
+rand = "0.7.3"
 
 [features]
 default = []
-fuzzing = ["libra-types/fuzzing", "storage-service", "storage-service/fuzzing"]
+fuzzing = ["libra-types/fuzzing", "storage-interface/fuzzing"]

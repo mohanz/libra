@@ -2,6 +2,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde_reflection::{ContainerFormat, Error, Format, FormatHolder, Named, VariantFormat};
+use std::collections::HashSet;
+
+#[test]
+fn test_format_visiting() {
+    use Format::*;
+
+    let format = ContainerFormat::Enum(
+        vec![(
+            0,
+            Named {
+                name: "foo".into(),
+                value: VariantFormat::Tuple(vec![
+                    TypeName("foo".into()),
+                    TypeName("bar".into()),
+                    Seq(Box::new(TypeName("foo".into()))),
+                ]),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let mut names = HashSet::new();
+    format
+        .visit(&mut |f| {
+            if let TypeName(x) = f {
+                // Insert a &str borrowed from `format`.
+                names.insert(x.as_str());
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(names.len(), 2);
+
+    assert!(VariantFormat::Unknown.visit(&mut |_| Ok(())).is_err());
+    assert!(Format::Unknown.visit(&mut |_| Ok(())).is_err());
+}
 
 #[test]
 fn test_format_unification() {

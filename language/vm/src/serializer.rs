@@ -468,38 +468,49 @@ fn serialize_signature_tokens(binary: &mut BinaryData, tokens: &[SignatureToken]
 /// A `SignatureToken` gets serialized as a variable size blob depending on composition.
 /// Values for types are defined in `SerializedType`.
 fn serialize_signature_token(binary: &mut BinaryData, token: &SignatureToken) -> Result<()> {
-    match token {
-        SignatureToken::Bool => binary.push(SerializedType::BOOL as u8),
-        SignatureToken::U8 => binary.push(SerializedType::U8 as u8),
-        SignatureToken::U64 => binary.push(SerializedType::U64 as u8),
-        SignatureToken::U128 => binary.push(SerializedType::U128 as u8),
-        SignatureToken::Address => binary.push(SerializedType::ADDRESS as u8),
-        SignatureToken::Vector(boxed_token) => {
-            binary.push(SerializedType::VECTOR as u8)?;
-            serialize_signature_token(binary, boxed_token)
-        }
-        SignatureToken::Struct(idx) => {
-            binary.push(SerializedType::STRUCT as u8)?;
-            write_u16_as_uleb128(binary, idx.0)
-        }
-        SignatureToken::StructInstantiation(idx, type_params) => {
-            binary.push(SerializedType::STRUCT_INST as u8)?;
-            write_u16_as_uleb128(binary, idx.0)?;
-            serialize_signature_tokens(binary, &type_params)
-        }
-        SignatureToken::Reference(boxed_token) => {
-            binary.push(SerializedType::REFERENCE as u8)?;
-            serialize_signature_token(binary, boxed_token)
-        }
-        SignatureToken::MutableReference(boxed_token) => {
-            binary.push(SerializedType::MUTABLE_REFERENCE as u8)?;
-            serialize_signature_token(binary, boxed_token)
-        }
-        SignatureToken::TypeParameter(idx) => {
-            binary.push(SerializedType::TYPE_PARAMETER as u8)?;
-            write_u16_as_uleb128(binary, *idx)
+    // Non-recursive implementation to avoid overflowing the stack.
+
+    for token in token.preorder_traversal() {
+        match token {
+            SignatureToken::Bool => binary.push(SerializedType::BOOL as u8)?,
+            SignatureToken::U8 => binary.push(SerializedType::U8 as u8)?,
+            SignatureToken::U64 => binary.push(SerializedType::U64 as u8)?,
+            SignatureToken::U128 => binary.push(SerializedType::U128 as u8)?,
+            SignatureToken::Address => binary.push(SerializedType::ADDRESS as u8)?,
+            SignatureToken::Vector(_) => {
+                binary.push(SerializedType::VECTOR as u8)?;
+            }
+            SignatureToken::Struct(idx) => {
+                binary.push(SerializedType::STRUCT as u8)?;
+                write_u16_as_uleb128(binary, idx.0)?;
+            }
+            SignatureToken::StructInstantiation(idx, type_params) => {
+                binary.push(SerializedType::STRUCT_INST as u8)?;
+                write_u16_as_uleb128(binary, idx.0)?;
+                let len = type_params.len();
+                if len > u8::max_value() as usize {
+                    bail!(
+                        "arguments/locals size ({}) cannot exceed {}",
+                        len,
+                        u8::max_value(),
+                    )
+                }
+                binary.push(len as u8)?;
+            }
+            SignatureToken::Reference(_) => {
+                binary.push(SerializedType::REFERENCE as u8)?;
+            }
+            SignatureToken::MutableReference(_) => {
+                binary.push(SerializedType::MUTABLE_REFERENCE as u8)?;
+            }
+            SignatureToken::TypeParameter(idx) => {
+                binary.push(SerializedType::TYPE_PARAMETER as u8)?;
+                write_u16_as_uleb128(binary, *idx)?;
+            }
         }
     }
+
+    Ok(())
 }
 
 fn serialize_nominal_resource_flag(
@@ -539,7 +550,6 @@ fn serialize_kinds(binary: &mut BinaryData, kinds: &[Kind]) -> Result<()> {
 /// - `CodeUnit.locals` as a ULEB128 (index into the `LocalSignaturePool`)
 /// - `CodeUnit.code` as variable size byte stream for the bytecode
 fn serialize_code_unit(binary: &mut BinaryData, code: &CodeUnit) -> Result<()> {
-    write_u16_as_uleb128(binary, code.max_stack_size)?;
     write_u16_as_uleb128(binary, code.locals.0)?;
     serialize_code(binary, &code.code)
 }
@@ -1164,7 +1174,7 @@ impl ScriptSerializer {
 
     fn serialize(&mut self, binary: &mut BinaryData, script: &CompiledScriptMut) -> Result<()> {
         self.common.serialize_common(binary, script)?;
-        self.serialize_main(binary, &script.main)
+        self.serialize_main(binary, &script)
     }
 
     fn serialize_header(&mut self, binary: &mut BinaryData) -> Result<()> {
@@ -1180,10 +1190,16 @@ impl ScriptSerializer {
     }
 
     /// Serializes the main function.
-    fn serialize_main(&mut self, binary: &mut BinaryData, main: &FunctionDefinition) -> Result<()> {
+    fn serialize_main(
+        &mut self,
+        binary: &mut BinaryData,
+        script: &CompiledScriptMut,
+    ) -> Result<()> {
         self.common.table_count += 1;
         self.main.0 = check_index_in_binary(binary.len())?;
-        serialize_function_definition(binary, main)?;
+        serialize_kinds(binary, &script.type_parameters)?;
+        write_u16_as_uleb128(binary, script.parameters.0)?;
+        serialize_code_unit(binary, &script.code)?;
         self.main.1 = checked_calculate_table_size(binary, self.main.0)?;
         Ok(())
     }

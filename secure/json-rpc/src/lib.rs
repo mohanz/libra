@@ -64,6 +64,7 @@ impl From<FromHexError> for Error {
 }
 
 /// Provides a lightweight JsonRpcClient implementation.
+#[derive(Clone)]
 pub struct JsonRpcClient {
     host: String,
 }
@@ -101,7 +102,7 @@ impl JsonRpcClient {
     pub fn get_account_state(
         &self,
         account: AccountAddress,
-        version: u64,
+        version: Option<u64>,
     ) -> Result<AccountState, Error> {
         let response = self.get_account_state_with_proof(account, version, version)?;
         match response.status() {
@@ -147,7 +148,7 @@ impl JsonRpcClient {
 
     // Sends a submit() request to the JSON RPC server using the given transaction.
     fn submit_transaction(&self, signed_transaction: SignedTransaction) -> Result<Response, Error> {
-        let method = "submit".to_string();
+        let method = "submit".into();
         let params = vec![Value::String(hex::encode(lcs::to_bytes(
             &signed_transaction,
         )?))];
@@ -155,18 +156,18 @@ impl JsonRpcClient {
     }
 
     // Sends a get_account_state_with_proof() request to the JSON RPC server for the specified
-    // account, version height and ledger_version height (for the proof).
+    // account, optional version height and optional ledger_version height (for the proof).
     fn get_account_state_with_proof(
         &self,
         account: AccountAddress,
-        version: u64,
-        ledger_version: u64,
+        version: Option<u64>,
+        ledger_version: Option<u64>,
     ) -> Result<Response, Error> {
-        let method = "get_account_state_with_proof".to_string();
+        let method = "get_account_state_with_proof".into();
         let params = vec![
             Value::String(account.to_string()),
-            Value::Number(version.into()),
-            Value::Number(ledger_version.into()),
+            json!(version),
+            json!(ledger_version),
         ];
         Ok(self.execute_request(method, params))
     }
@@ -274,11 +275,12 @@ mod test {
     use libra_json_rpc::bootstrap;
     use libra_types::{
         account_address::AccountAddress,
-        account_config::{AccountResource, BalanceResource},
+        account_config::{from_currency_code_string, AccountResource, BalanceResource, LBR_NAME},
         account_state::AccountState,
         account_state_blob::{AccountStateBlob, AccountStateWithProof},
         block_info::BlockInfo,
         contract_event::ContractEvent,
+        epoch_change::EpochChangeProof,
         event::{EventHandle, EventKey},
         ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
         mempool_status::{MempoolStatus, MempoolStatusCode},
@@ -290,13 +292,11 @@ mod test {
             SignedTransaction, TransactionInfo, TransactionListWithProof, TransactionWithProof,
             Version,
         },
-        validator_change::ValidatorChangeProof,
         vm_error::StatusCode,
     };
     use libradb::errors::LibraDbError::NotFound;
     use std::{collections::BTreeMap, convert::TryFrom, sync::Arc};
-    use storage_interface::DbReader;
-    use storage_proto::StartupInfo;
+    use storage_interface::{DbReader, StartupInfo, TreeState};
     use tokio::runtime::Runtime;
     use vm_validator::{
         mocks::mock_vm_validator::MockVMValidator, vm_validator::TransactionValidation,
@@ -344,7 +344,28 @@ mod test {
         let (client, _server) = create_client_and_server(mock_db, true);
 
         // Ensure the client returns the correct AccountState
-        let result = client.get_account_state(account, version_height);
+        let result = client.get_account_state(account, Some(version_height));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), account_state);
+    }
+
+    #[test]
+    fn test_get_account_state_version_not_specified() {
+        // Create test account state data
+        let account = AccountAddress::random();
+        let account_state = create_test_account_state();
+        let account_state_with_proof = create_test_state_with_proof(&account_state, 0);
+
+        // Create an account to account_state_with_proof mapping
+        let mut map = BTreeMap::new();
+        map.insert(account, account_state_with_proof);
+
+        // Populate the test database with the test data and create the client/server
+        let mock_db = MockLibraDB::new(map);
+        let (client, _server) = create_client_and_server(mock_db, true);
+
+        // Ensure the client returns the latest AccountState (even though no version was specified)
+        let result = client.get_account_state(account, None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), account_state);
     }
@@ -356,7 +377,7 @@ mod test {
 
         // Ensure the client returns an error for a missing AccountState
         let account = AccountAddress::random();
-        let result = client.get_account_state(account, 0);
+        let result = client.get_account_state(account, Some(0));
         assert!(result.is_err());
     }
 
@@ -378,7 +399,7 @@ mod test {
         let (client, _server) = create_client_and_server(mock_db, true);
 
         // Ensure the client returns an error for the missing AccountState
-        let result = client.get_account_state(account, version_height);
+        let result = client.get_account_state(account, Some(version_height));
         assert!(result.is_err());
     }
 
@@ -400,11 +421,7 @@ mod test {
             // Provide a VMValidator to the runtime.
             server.spawn(async move {
                 while let Some((txn, cb)) = mp_events.next().await {
-                    let vm_status = MockVMValidator
-                        .validate_transaction(txn)
-                        .await
-                        .unwrap()
-                        .status();
+                    let vm_status = MockVMValidator.validate_transaction(txn).unwrap().status();
                     let result = if vm_status.is_some() {
                         (MempoolStatus::new(MempoolStatusCode::VmError), vm_status)
                     } else {
@@ -464,7 +481,8 @@ mod test {
             false,
             EventHandle::random_handle(100),
             EventHandle::random_handle(100),
-            0,
+            false,
+            from_currency_code_string(LBR_NAME).unwrap(),
         )
     }
 
@@ -560,7 +578,7 @@ mod test {
             &self,
             _known_version: u64,
             _ledger_info: LedgerInfoWithSignatures,
-        ) -> Result<(ValidatorChangeProof, AccumulatorConsistencyProof)> {
+        ) -> Result<(EpochChangeProof, AccumulatorConsistencyProof)> {
             unimplemented!()
         }
 
@@ -569,7 +587,7 @@ mod test {
             _known_version: u64,
         ) -> Result<(
             LedgerInfoWithSignatures,
-            ValidatorChangeProof,
+            EpochChangeProof,
             AccumulatorConsistencyProof,
         )> {
             unimplemented!()
@@ -586,7 +604,7 @@ mod test {
             if let Some(account_state_proof) = self.account_states_with_proof.get(&address) {
                 Ok(account_state_proof.clone())
             } else {
-                Err(NotFound("AccountStateWithProof".to_string()).into())
+                Err(NotFound("AccountStateWithProof".into()).into())
             }
         }
 
@@ -599,6 +617,18 @@ mod test {
         }
 
         fn get_latest_state_root(&self) -> Result<(u64, HashValue)> {
+            unimplemented!()
+        }
+
+        fn get_latest_tree_state(&self) -> Result<TreeState> {
+            unimplemented!()
+        }
+
+        fn get_epoch_change_ledger_infos(&self, _: u64, _: u64) -> Result<EpochChangeProof> {
+            unimplemented!()
+        }
+
+        fn get_ledger_info(&self, _: u64) -> Result<LedgerInfoWithSignatures> {
             unimplemented!()
         }
     }

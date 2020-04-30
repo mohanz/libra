@@ -5,16 +5,30 @@
 
 use itertools::Itertools;
 use spec_lang::{
-    env::{FieldEnv, FunctionEnv, GlobalEnv, ModuleEnv, ModuleId, SpecFunId, StructEnv, StructId},
+    env::{
+        FieldEnv, FunctionEnv, GlobalEnv, ModuleEnv, ModuleId, SpecFunId, StructEnv, StructId,
+        SCRIPT_MODULE_NAME,
+    },
     symbol::Symbol,
     ty::{PrimitiveType, Type},
 };
+
+/// Return boogie name of given module.
+pub fn boogie_module_name(env: &ModuleEnv<'_>) -> String {
+    let name = env.symbol_pool().string(env.get_name().name());
+    if name.as_str() == SCRIPT_MODULE_NAME {
+        // <SELF> is not accepted by boogie as a symbol
+        "#SELF#".to_string()
+    } else {
+        name.to_string()
+    }
+}
 
 /// Return boogie name of given structure.
 pub fn boogie_struct_name(env: &StructEnv<'_>) -> String {
     format!(
         "${}_{}",
-        env.module_env.get_name().name().display(env.symbol_pool()),
+        boogie_module_name(&env.module_env),
         env.get_name().display(env.symbol_pool())
     )
 }
@@ -30,18 +44,26 @@ pub fn boogie_field_name(env: &FieldEnv<'_>) -> String {
 
 /// Return boogie name of given function.
 pub fn boogie_function_name(env: &FunctionEnv<'_>) -> String {
-    format!(
+    let name = format!(
         "${}_{}",
-        env.module_env.get_name().name().display(env.symbol_pool()),
+        boogie_module_name(&env.module_env),
         env.get_name().display(env.symbol_pool())
-    )
+    );
+    // TODO: hack to deal with similar native functions in old/new library. We identify
+    // whether the old or new version of the function is referenced by the number of type
+    // parameters.
+    if name == "$LibraAccount_save_account" && env.get_type_parameters().len() == 1 {
+        name + "_OLD"
+    } else {
+        name
+    }
 }
 
 /// Return boogie name of given spec var.
 pub fn boogie_spec_var_name(env: &ModuleEnv<'_>, name: Symbol) -> String {
     format!(
         "${}_{}",
-        env.get_name().name().display(env.symbol_pool()),
+        boogie_module_name(env),
         name.display(env.symbol_pool())
     )
 }
@@ -60,7 +82,7 @@ pub fn boogie_spec_fun_name(env: &ModuleEnv<'_>, id: SpecFunId) -> String {
     };
     format!(
         "${}_{}{}",
-        env.get_name().name().display(env.symbol_pool()),
+        boogie_module_name(env),
         decl.name.display(env.symbol_pool()),
         overload_qualifier
     )
@@ -97,8 +119,7 @@ pub fn boogie_struct_type_value(
     struct_id: StructId,
     args: &[Type],
 ) -> String {
-    let module_env = env.get_module(module_id);
-    let struct_env = module_env.get_struct(struct_id);
+    let struct_env = env.get_module(module_id).into_struct(struct_id);
     format!(
         "{}_type_value({})",
         boogie_struct_name(&struct_env),
@@ -207,13 +228,49 @@ pub fn boogie_well_formed_check(
 }
 
 /// Create boogie global variable with type constraint. No references allowed.
-pub fn boogie_declare_global(env: &GlobalEnv, name: &str, ty: &Type) -> String {
+pub fn boogie_declare_global(env: &GlobalEnv, name: &str, param_count: usize, ty: &Type) -> String {
+    let declarator = boogie_global_declarator(env, name, param_count, ty);
     assert!(!ty.is_reference());
-    format!(
-        "var {} : Value where {};",
-        name,
-        boogie_well_formed_expr(env, name, ty, WellFormedMode::Default)
-    )
+    if param_count > 0 {
+        let var_selector = format!(
+            "{}[{}]",
+            name,
+            (0..param_count).map(|i| format!("$tv{}", i)).join(", ")
+        );
+        let type_check = boogie_well_formed_expr(env, &var_selector, ty, WellFormedMode::Default);
+        format!(
+            "var {} where (forall {} :: {});",
+            declarator,
+            (0..param_count)
+                .map(|i| format!("$tv{}: TypeValue", i))
+                .join(", "),
+            type_check
+        )
+    } else {
+        format!(
+            "var {} where {};",
+            declarator,
+            boogie_well_formed_expr(env, name, ty, WellFormedMode::Default)
+        )
+    }
+}
+
+pub fn boogie_global_declarator(
+    _env: &GlobalEnv,
+    name: &str,
+    param_count: usize,
+    ty: &Type,
+) -> String {
+    assert!(!ty.is_reference());
+    if param_count > 0 {
+        format!(
+            "{} : [{}]Value",
+            name,
+            (0..param_count).map(|_| "TypeValue").join(", ")
+        )
+    } else {
+        format!("{} : Value", name)
+    }
 }
 
 pub fn boogie_var_before_borrow(idx: usize) -> String {

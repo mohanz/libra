@@ -1,22 +1,99 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::Result;
-use libra_crypto::HashValue;
+use anyhow::{format_err, Result};
+use itertools::Itertools;
+use libra_crypto::{hash::SPARSE_MERKLE_PLACEHOLDER_HASH, HashValue};
 use libra_types::{
+    access_path::AccessPath,
     account_address::AccountAddress,
+    account_state::AccountState,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::ContractEvent,
+    epoch_change::EpochChangeProof,
+    epoch_info::EpochInfo,
     event::EventKey,
+    get_with_proof::{RequestItem, ResponseItem},
     ledger_info::LedgerInfoWithSignatures,
-    proof::{AccumulatorConsistencyProof, SparseMerkleProof},
+    move_resource::MoveStorage,
+    proof::{definition::LeafCount, AccumulatorConsistencyProof, SparseMerkleProof},
     transaction::{TransactionListWithProof, TransactionToCommit, TransactionWithProof, Version},
-    validator_change::ValidatorChangeProof,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use storage_proto::StartupInfo;
+use std::{
+    collections::{HashMap, HashSet},
+    convert::TryFrom,
+    sync::Arc,
+};
 use thiserror::Error;
+
+#[cfg(any(feature = "testing", feature = "fuzzing"))]
+pub mod mock;
+pub mod state_view;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartupInfo {
+    /// The latest ledger info.
+    pub latest_ledger_info: LedgerInfoWithSignatures,
+    /// If the above ledger info doesn't carry a validator set, the latest validator set. Otherwise
+    /// `None`.
+    pub latest_epoch_info: Option<EpochInfo>,
+    pub committed_tree_state: TreeState,
+    pub synced_tree_state: Option<TreeState>,
+}
+
+impl StartupInfo {
+    pub fn new(
+        latest_ledger_info: LedgerInfoWithSignatures,
+        latest_epoch_info: Option<EpochInfo>,
+        committed_tree_state: TreeState,
+        synced_tree_state: Option<TreeState>,
+    ) -> Self {
+        Self {
+            latest_ledger_info,
+            latest_epoch_info,
+            committed_tree_state,
+            synced_tree_state,
+        }
+    }
+
+    pub fn get_epoch_info(&self) -> &EpochInfo {
+        self.latest_ledger_info
+            .ledger_info()
+            .next_epoch_info()
+            .unwrap_or_else(|| {
+                self.latest_epoch_info
+                    .as_ref()
+                    .expect("EpochInfo must exist")
+            })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TreeState {
+    pub num_transactions: LeafCount,
+    pub ledger_frozen_subtree_hashes: Vec<HashValue>,
+    pub account_state_root_hash: HashValue,
+}
+
+impl TreeState {
+    pub fn new(
+        num_transactions: LeafCount,
+        ledger_frozen_subtree_hashes: Vec<HashValue>,
+        account_state_root_hash: HashValue,
+    ) -> Self {
+        Self {
+            num_transactions,
+            ledger_frozen_subtree_hashes,
+            account_state_root_hash,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.num_transactions == 0
+            && self.account_state_root_hash == *SPARSE_MERKLE_PLACEHOLDER_HASH
+    }
+}
 
 #[derive(Debug, Deserialize, Error, PartialEq, Serialize)]
 pub enum Error {
@@ -52,6 +129,30 @@ impl From<libra_secure_net::Error> for Error {
 /// Trait that is implemented by a DB that supports certain public (to client) read APIs
 /// expected of a Libra DB
 pub trait DbReader: Send + Sync {
+    // TODO: Remove this API after deprecating AC.
+    fn update_to_latest_ledger(
+        &self,
+        _client_known_version: Version,
+        _request_items: Vec<RequestItem>,
+    ) -> Result<(
+        Vec<ResponseItem>,
+        LedgerInfoWithSignatures,
+        EpochChangeProof,
+        AccumulatorConsistencyProof,
+    )> {
+        unimplemented!()
+    }
+
+    /// See [`LibraDB::get_epoch_change_ledger_infos`].
+    ///
+    /// [`LibraDB::get_epoch_change_ledger_infos`]:
+    /// ../libradb/struct.LibraDB.html#method.get_epoch_change_ledger_infos
+    fn get_epoch_change_ledger_infos(
+        &self,
+        start_epoch: u64,
+        end_epoch: u64,
+    ) -> Result<EpochChangeProof>;
+
     /// See [`LibraDB::get_transactions`].
     ///
     /// [`LibraDB::get_transactions`]: ../libradb/struct.LibraDB.html#method.get_transactions
@@ -115,7 +216,7 @@ pub trait DbReader: Send + Sync {
         &self,
         known_version: u64,
         ledger_info: LedgerInfoWithSignatures,
-    ) -> Result<(ValidatorChangeProof, AccumulatorConsistencyProof)>;
+    ) -> Result<(EpochChangeProof, AccumulatorConsistencyProof)>;
 
     /// Returns proof of new state relative to version known to client
     fn get_state_proof(
@@ -123,7 +224,7 @@ pub trait DbReader: Send + Sync {
         known_version: u64,
     ) -> Result<(
         LedgerInfoWithSignatures,
-        ValidatorChangeProof,
+        EpochChangeProof,
         AccumulatorConsistencyProof,
     )>;
 
@@ -136,18 +237,80 @@ pub trait DbReader: Send + Sync {
         ledger_version: Version,
     ) -> Result<AccountStateWithProof>;
 
-    /// Gets an account state by account address, out of the ledger state indicated by the state
-    /// Merkle tree root hash.
-    ///
-    /// This is used by libra core (executor) internally.
+    // Gets an account state by account address, out of the ledger state indicated by the state
+    // Merkle tree root with a sparse merkle proof proving state tree root.
+    // See [`LibraDB::get_account_state_with_proof_by_version`].
+    //
+    // [`LibraDB::get_account_state_with_proof_by_version`]:
+    // ../libradb/struct.LibraDB.html#method.get_account_state_with_proof_by_version
+    //
+    // This is used by libra core (executor) internally.
     fn get_account_state_with_proof_by_version(
         &self,
         address: AccountAddress,
         version: Version,
     ) -> Result<(Option<AccountStateBlob>, SparseMerkleProof)>;
 
-    /// Gets the latest state root hash together with its version.
+    /// See [`LibraDB::get_latest_state_root`].
+    ///
+    /// [`LibraDB::get_latest_state_root`]:
+    /// ../libradb/struct.LibraDB.html#method.get_latest_state_root
     fn get_latest_state_root(&self) -> Result<(Version, HashValue)>;
+
+    /// Gets the latest TreeState no matter if db has been bootstrapped.
+    /// Used by the Db-bootstrapper.
+    fn get_latest_tree_state(&self) -> Result<TreeState>;
+
+    /// Get the ledger info of the epoch that `known_version` belongs to.
+    fn get_ledger_info(&self, known_version: u64) -> Result<LedgerInfoWithSignatures>;
+}
+
+impl MoveStorage for &dyn DbReader {
+    fn batch_fetch_resources(&self, access_paths: Vec<AccessPath>) -> Result<Vec<Vec<u8>>> {
+        self.batch_fetch_resources_by_version(access_paths, self.get_latest_version()?)
+    }
+
+    fn batch_fetch_resources_by_version(
+        &self,
+        access_paths: Vec<AccessPath>,
+        version: Version,
+    ) -> Result<Vec<Vec<u8>>> {
+        let addresses: Vec<AccountAddress> = access_paths
+            .iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|path| path.address)
+            .collect();
+
+        let results = addresses
+            .iter()
+            .map(|addr| self.get_account_state_with_proof(addr.clone(), version, version))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Account address --> AccountState
+        let account_states = addresses
+            .into_iter()
+            .zip_eq(results)
+            .map(|(addr, result)| {
+                let account_state = AccountState::try_from(&result.blob.ok_or_else(|| {
+                    format_err!("missing blob in account state/account does not exist")
+                })?)?;
+                Ok((addr, account_state))
+            })
+            .collect::<Result<HashMap<_, AccountState>>>()?;
+
+        access_paths
+            .into_iter()
+            .map(|path| {
+                Ok(account_states
+                    .get(&path.address)
+                    .ok_or_else(|| format_err!("missing account state for queried access path"))?
+                    .get(&path.path)
+                    .ok_or_else(|| format_err!("no value found in account state"))?
+                    .clone())
+            })
+            .collect()
+    }
 }
 
 /// Trait that is implemented by a DB that supports certain public (to client) write APIs

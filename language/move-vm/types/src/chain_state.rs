@@ -1,14 +1,12 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{loaded_data::types::StructType, values::GlobalValue};
+use crate::{loaded_data::types::FatStructType, values::GlobalValue};
 use libra_types::{
     access_path::AccessPath, contract_event::ContractEvent, language_storage::ModuleId,
 };
-use vm::{
-    errors::VMResult,
-    gas_schedule::{GasCarrier, GasUnits},
-};
+use move_core_types::gas_schedule::{GasCarrier, GasUnits};
+use vm::errors::VMResult;
 
 /// Trait that describes what Move bytecode runtime expects from the Libra blockchain.
 pub trait ChainState {
@@ -40,21 +38,25 @@ pub trait ChainState {
     fn borrow_resource(
         &mut self,
         ap: &AccessPath,
-        ty: StructType,
+        ty: &FatStructType,
     ) -> VMResult<Option<&GlobalValue>>;
 
     /// Transfer ownership of a resource stored on chain to the VM.
     fn move_resource_from(
         &mut self,
         ap: &AccessPath,
-        ty: StructType,
+        ty: &FatStructType,
     ) -> VMResult<Option<GlobalValue>>;
 
     /// Publish a module to be stored on chain.
     fn publish_module(&mut self, module_id: ModuleId, module: Vec<u8>) -> VMResult<()>;
 
     /// Publish a resource to be stored on chain.
-    fn publish_resource(&mut self, ap: &AccessPath, g: (StructType, GlobalValue)) -> VMResult<()>;
+    fn publish_resource(
+        &mut self,
+        ap: &AccessPath,
+        g: (FatStructType, GlobalValue),
+    ) -> VMResult<()>;
 
     /// Check if this module exists on chain.
     // TODO: Can we get rid of this api with the loader refactor?

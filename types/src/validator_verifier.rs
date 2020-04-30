@@ -8,6 +8,9 @@ use libra_crypto::{
     HashValue, VerifyingKey,
 };
 use mirai_annotations::*;
+#[cfg(any(test, feature = "fuzzing"))]
+use proptest_derive::Arbitrary;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
 
@@ -41,7 +44,8 @@ pub enum VerifyError {
 }
 
 /// Helper struct to manage validator information for validation
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct ValidatorConsensusInfo {
     public_key: Ed25519PublicKey,
     voting_power: u64,
@@ -67,7 +71,8 @@ impl ValidatorConsensusInfo {
 /// Supports validation of signatures for known authors with individual voting powers. This struct
 /// can be used for all signature verification operations including block and network signature
 /// verification, respectively.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct ValidatorVerifier {
     /// An ordered map of each validator's on-chain account address to its pubkeys
     /// and voting power.
@@ -281,12 +286,12 @@ impl From<&ValidatorSet> for ValidatorVerifier {
     fn from(validator_set: &ValidatorSet) -> Self {
         ValidatorVerifier::new(validator_set.payload().iter().fold(
             BTreeMap::new(),
-            |mut map, key| {
+            |mut map, validator| {
                 map.insert(
-                    key.account_address().clone(),
+                    validator.account_address().clone(),
                     ValidatorConsensusInfo::new(
-                        key.consensus_public_key().clone(),
-                        key.consensus_voting_power(),
+                        validator.consensus_public_key().clone(),
+                        validator.consensus_voting_power(),
                     ),
                 );
                 map
@@ -298,15 +303,11 @@ impl From<&ValidatorSet> for ValidatorVerifier {
 #[cfg(any(test, feature = "fuzzing"))]
 impl From<&ValidatorVerifier> for ValidatorSet {
     fn from(verifier: &ValidatorVerifier) -> Self {
-        use libra_crypto::test_utils::TEST_SEED;
-        use rand::prelude::*;
-        let mut rng = StdRng::from_seed(TEST_SEED);
         ValidatorSet::new(
             verifier
                 .get_ordered_account_addresses_iter()
                 .map(|addr| {
                     crate::validator_info::ValidatorInfo::new_with_test_network_keys(
-                        &mut rng,
                         addr,
                         verifier.get_public_key(&addr).unwrap(),
                         verifier.get_voting_power(&addr).unwrap(),
