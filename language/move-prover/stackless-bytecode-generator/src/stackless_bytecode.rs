@@ -107,7 +107,6 @@ pub enum Operation {
     GetGlobal(ModuleId, StructId, Vec<Type>),
 
     // Builtins
-    Abort,
     Destroy,
     ReadRef,
     WriteRef,
@@ -153,6 +152,7 @@ pub enum Bytecode {
     Branch(AttrId, Label, Label, TempIndex),
     Jump(AttrId, Label),
     Label(AttrId, Label),
+    Abort(AttrId, TempIndex),
     Nop(AttrId),
 }
 
@@ -168,6 +168,7 @@ impl Bytecode {
             | Branch(id, ..)
             | Jump(id, ..)
             | Label(id, ..)
+            | Abort(id, ..)
             | Nop(id) => *id,
         }
     }
@@ -177,7 +178,10 @@ impl Bytecode {
     }
 
     pub fn is_unconditional_branch(&self) -> bool {
-        matches!(self, Bytecode::Ret(..) | Bytecode::Jump(..))
+        matches!(
+            self,
+            Bytecode::Ret(..) | Bytecode::Jump(..) | Bytecode::Abort(..)
+        )
     }
 
     pub fn is_conditional_branch(&self) -> bool {
@@ -216,27 +220,15 @@ impl Bytecode {
         label_offsets: &BTreeMap<Label, CodeOffset>,
     ) -> Vec<CodeOffset> {
         let bytecode = &code[pc as usize];
+        assert!(bytecode.is_branch());
         let mut v = vec![];
-
         for label in bytecode.branch_dests() {
             v.push(*label_offsets.get(&label).expect("label defined"));
         }
-
-        let next_pc = pc + 1;
-        if next_pc >= code.len() as CodeOffset {
-            return v;
-        }
-
-        if !bytecode.is_unconditional_branch() && !v.contains(&next_pc) {
-            // avoid duplicates
-            v.push(next_pc);
-        }
-
         // always give successors in ascending order
         if v.len() > 1 && v[0] > v[1] {
             v.swap(0, 1);
         }
-
         v
     }
 }
@@ -312,6 +304,9 @@ impl<'env> fmt::Display for BytecodeDisplay<'env> {
             }
             Label(_, label) => {
                 write!(f, "L{}:", label.as_usize(),)?;
+            }
+            Abort(_, src) => {
+                write!(f, "abort({})", self.lstr(*src))?;
             }
             Nop(_) => {
                 write!(f, "nop")?;
@@ -451,9 +446,6 @@ impl<'env> fmt::Display for OperationDisplay<'env> {
             }
 
             // Builtins
-            Abort => {
-                write!(f, "abort")?;
-            }
             Destroy => {
                 write!(f, "destroy")?;
             }

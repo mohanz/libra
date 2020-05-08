@@ -3,7 +3,8 @@
 
 use crate::{libra_interface::JsonRpcLibraInterface, Action, Error, KeyManager, LibraInterface};
 use anyhow::Result;
-use executor::{db_bootstrapper, BlockExecutor, Executor};
+use executor::{db_bootstrapper, Executor};
+use executor_types::BlockExecutor;
 use futures::{channel::mpsc::channel, StreamExt};
 use libra_config::{config::NodeConfig, utils, utils::get_genesis_txn};
 use libra_crypto::{ed25519::Ed25519PrivateKey, HashValue, PrivateKey, Uniform};
@@ -203,7 +204,7 @@ impl MockLibraInterface {
     }
 
     pub fn retrieve_configuration_resource(&self) -> Result<ConfigurationResource, Error> {
-        let account = account_config::association_address();
+        let account = libra_types::on_chain_config::config_address();
         let account_state = self.retrieve_account_state(account)?;
         account_state
             .get_configuration_resource()?
@@ -320,11 +321,16 @@ fn setup_node<T: LibraInterface + Clone>(
     let account = config.validator_network.as_ref().unwrap().peer_id;
     let time = MockTimeService::new();
     let libra_test_harness = LibraInterfaceTestHarness::new(libra);
+    let key_manager_config = &config.secure.key_manager;
+
     let key_manager = KeyManager::new(
         account,
         libra_test_harness.clone(),
         setup_secure_storage(&config, time.clone()),
         time.clone(),
+        key_manager_config.rotation_period_secs,
+        key_manager_config.sleep_period_secs,
+        key_manager_config.txn_expiration_secs,
     );
 
     Node::new(account, executor, libra_test_harness, key_manager, time)
@@ -540,21 +546,22 @@ fn test_execute() {
     // Test the mock libra interface implementation
     let (config, _genesis_key) = config_builder::test_config();
     let node = setup_node_using_test_mocks(&config);
-    verify_execute(node);
+    verify_execute(&config, node);
 
     // Test the json libra interface implementation
     let (config, _genesis_key) = config_builder::test_config();
     let (node, _runtime) = setup_node_using_json_rpc(&config);
-    verify_execute(node);
+    verify_execute(&config, node);
 }
 
-fn verify_execute<T: LibraInterface>(mut node: Node<T>) {
+fn verify_execute<T: LibraInterface>(config: &NodeConfig, mut node: Node<T>) {
     // Verify correct initial state (i.e., nothing to be done by key manager)
     assert_eq!(0, node.time.now());
     assert_eq!(0, node.libra.last_reconfiguration().unwrap());
 
     // Verify rotation required after enough time
-    node.time.increment_by(crate::ROTATION_PERIOD_SECS);
+    node.time
+        .increment_by(config.secure.key_manager.rotation_period_secs);
     node.update_libra_timestamp();
     assert_eq!(
         Action::FullKeyRotation,
@@ -573,7 +580,8 @@ fn verify_execute<T: LibraInterface>(mut node: Node<T>) {
     );
 
     // Verify rotation transaction not executed, now expired
-    node.time.increment_by(crate::TXN_RETRY_SECS);
+    node.time
+        .increment_by(config.secure.key_manager.txn_expiration_secs);
     node.update_libra_timestamp();
     assert_eq!(
         Action::SubmitKeyRotationTransaction,

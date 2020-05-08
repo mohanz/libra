@@ -247,16 +247,27 @@ impl ClientProxy {
     }
 
     /// Get balance from validator for the account specified.
-    pub fn get_balance(&mut self, space_delim_strings: &[&str]) -> Result<String> {
+    pub fn get_balances(&mut self, space_delim_strings: &[&str]) -> Result<Vec<String>> {
         ensure!(
             space_delim_strings.len() == 2,
-            "Invalid number of arguments for getting balance"
+            "Invalid number of arguments for getting balances"
         );
         let (address, _) = self.get_account_address_from_parameter(space_delim_strings[1])?;
         self.get_account_resource_and_update(address).map(|res| {
-            let whole_num = res.balance.amount / 1_000_000;
-            let remainder = res.balance.amount % 1_000_000;
-            format!("{}.{:0>6}", whole_num.to_string(), remainder.to_string())
+            res.balances
+                .iter()
+                .map(|amt_view| {
+                    // TODO: Need to get these numbers from CurrencyInfoView for the specific currency
+                    let whole_num = amt_view.amount / 1_000_000;
+                    let remainder = amt_view.amount % 1_000_000;
+                    format!(
+                        "{}.{:0>6}{}",
+                        whole_num.to_string(),
+                        remainder.to_string(),
+                        amt_view.currency
+                    )
+                })
+                .collect()
         })
     }
 
@@ -535,6 +546,7 @@ impl ClientProxy {
                 receiver_auth_key_prefix,
                 num_coins,
                 vec![],
+                vec![],
             );
             let txn = self.create_txn_to_submit(
                 TransactionPayload::Script(program),
@@ -579,6 +591,7 @@ impl ClientProxy {
             &receiver_address,
             receiver_auth_key_prefix,
             num_coins,
+            vec![],
             vec![],
         );
 
@@ -653,7 +666,7 @@ impl ClientProxy {
     }
 
     /// Compile Move program
-    pub fn compile_program(&mut self, space_delim_strings: &[&str]) -> Result<String> {
+    pub fn compile_program(&mut self, space_delim_strings: &[&str]) -> Result<Vec<String>> {
         ensure!(
             space_delim_strings[0] == "compile",
             "inconsistent command '{}' for compile_program",
@@ -687,21 +700,24 @@ impl ClientProxy {
             return Err(format_err!("compilation failed"));
         }
 
-        let mut output_files: Vec<_> = fs::read_dir(tmp_output_path)?.collect();
-        match output_files.pop() {
-            None => Err(format_err!("compiler failed to produce an output file")),
-            Some(file) => {
-                if !output_files.is_empty() {
-                    Err(format_err!("compiler output has more than one file"))
-                } else {
-                    Ok(file?
-                        .path()
-                        .to_str()
-                        .expect("compiler output file path cannot be converted to a string")
-                        .to_string())
-                }
-            }
+        let output_files = walkdir::WalkDir::new(tmp_output_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let path = e.path();
+                e.file_type().is_file()
+                    && path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|ext| ext == "mv")
+                        .unwrap_or(false)
+            })
+            .filter_map(|e| e.path().to_str().map(|s| s.to_string()))
+            .collect::<Vec<_>>();
+        if output_files.is_empty() {
+            bail!("compiler failed to produce an output file")
         }
+        Ok(output_files)
     }
 
     /// Submit a transaction to the network given the unsigned raw transaction, sender public key

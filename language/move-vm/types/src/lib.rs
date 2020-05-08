@@ -22,10 +22,10 @@ macro_rules! debug_writeln {
 }
 
 pub mod chain_state;
-pub mod identifier;
+pub mod gas_schedule;
 pub mod interpreter_context;
 pub mod loaded_data;
-pub mod native_functions;
+pub mod natives;
 pub mod values;
 
 #[cfg(test)]

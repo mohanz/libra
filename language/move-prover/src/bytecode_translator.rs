@@ -7,8 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use itertools::Itertools;
 #[allow(unused_imports)]
-use log::{debug, info};
-use num::Zero;
+use log::{debug, info, warn};
 
 use spec_lang::{
     env::{GlobalEnv, Loc, ModuleEnv, StructEnv, TypeParameter},
@@ -36,7 +35,6 @@ use crate::{
     code_writer::CodeWriter,
     spec_translator::SpecTranslator,
 };
-use spec_lang::ast::Value;
 
 pub struct BoogieTranslator<'env> {
     env: &'env GlobalEnv,
@@ -123,14 +121,6 @@ impl<'env> ModuleTranslator<'env> {
         }
     }
 
-    /// Returns true if for the module no code should be produced because its already defined
-    /// in the prelude.
-    pub fn is_module_provided_by_prelude(&self) -> bool {
-        let name = self.module_env.get_name();
-        self.module_env.symbol_pool().string(name.name()).as_str() == "Vector"
-            && name.addr().is_zero()
-    }
-
     /// Translates this module.
     fn translate(&mut self) {
         info!(
@@ -144,9 +134,6 @@ impl<'env> ModuleTranslator<'env> {
         let spec_translator = SpecTranslator::new(self.writer, &self.module_env, false);
         spec_translator.translate_spec_vars();
         spec_translator.translate_spec_funs();
-        if self.is_module_provided_by_prelude() {
-            return;
-        }
         self.translate_structs();
         self.translate_functions();
     }
@@ -360,12 +347,13 @@ impl<'env> ModuleTranslator<'env> {
         }
         if num_fun > 0 {
             info!(
-                "{} out of {} functions are specified in module {}",
+                "{} out of {} functions have (directly or indirectly) \
+                 specifications in module `{}`",
                 num_fun_specified,
                 num_fun,
                 self.module_env
                     .get_name()
-                    .display(self.module_env.symbol_pool())
+                    .display_full(self.module_env.symbol_pool())
             );
         }
     }
@@ -410,24 +398,12 @@ impl<'env> ModuleTranslator<'env> {
         }
         // We look up the `verify` pragma property first in this function, then in
         // the module, and finally fall back to the value of option `--verify`.
-        let prop_name = &func_target.symbol_pool().make("verify");
-        if let Some(Value::Bool(b)) = func_target.func_env.get_spec().properties.get(prop_name) {
-            return *b;
-        }
-        if let Some(Value::Bool(b)) = func_target
-            .func_env
-            .module_env
-            .get_spec()
-            .properties
-            .get(prop_name)
-        {
-            return *b;
-        }
-        match self.options.verify_scope {
+        let default = || match self.options.verify_scope {
             VerificationScope::Public => func_target.func_env.is_public(),
             VerificationScope::All => true,
             VerificationScope::None => false,
-        }
+        };
+        func_target.is_pragma_true("verify", default)
     }
 
     /// Return a string for a boogie procedure header.
@@ -908,6 +884,15 @@ impl<'env> ModuleTranslator<'env> {
                         "call $tmp := $CopyOrMoveValue($GetLocal($m, $frame + {}));",
                         src
                     );
+                    emit!(
+                        self.writer,
+                        &boogie_well_formed_check(
+                            self.module_env.env,
+                            "$tmp",
+                            &func_target.get_local_type(*dest),
+                            WellFormedMode::Default
+                        )
+                    );
                     emitln!(self.writer, &update_and_track_local(*dest, "$tmp"));
                 }
             }
@@ -1008,7 +993,6 @@ impl<'env> ModuleTranslator<'env> {
                         // code outside of the module is executed.
                         if callee_env.module_env.get_id()
                             != func_target.func_env.module_env.get_id()
-                            && callee_env.module_env.get_spec().has_conditions()
                         {
                             let spec_translator =
                                 SpecTranslator::new(self.writer, &callee_env.module_env, false)
@@ -1623,23 +1607,23 @@ impl<'env> ModuleTranslator<'env> {
                             bytecode
                         );
                     }
-                    Abort => {
-                        // Below we introduce a dummy `if` for $DebugTrackAbort to ensure boogie creates
-                        // a execution trace entry for this statement.
-                        emitln!(
-                            self.writer,
-                            "if (true) {{ assume $DebugTrackAbort({}, {}); }}",
-                            func_target
-                                .func_env
-                                .module_env
-                                .env
-                                .file_id_to_idx(loc.file_id()),
-                            loc.span().start(),
-                        );
-                        emitln!(self.writer, "goto Abort;")
-                    }
                     Destroy => {}
                 }
+            }
+            Abort(..) => {
+                // Below we introduce a dummy `if` for $DebugTrackAbort to ensure boogie creates
+                // a execution trace entry for this statement.
+                emitln!(
+                    self.writer,
+                    "if (true) {{ assume $DebugTrackAbort({}, {}); }}",
+                    func_target
+                        .func_env
+                        .module_env
+                        .env
+                        .file_id_to_idx(loc.file_id()),
+                    loc.span().start(),
+                );
+                emitln!(self.writer, "goto Abort;")
             }
             Nop(..) => {}
         }

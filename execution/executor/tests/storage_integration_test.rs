@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, format_err, Result};
-use executor::{db_bootstrapper::bootstrap_db_if_empty, BlockExecutor, Executor};
+use executor::{db_bootstrapper::bootstrap_db_if_empty, Executor};
+use executor_types::BlockExecutor;
 use executor_utils::test_helpers::{
     extract_signer, gen_block_id, gen_block_metadata, gen_ledger_info_with_sigs,
     get_test_signed_transaction,
@@ -10,7 +11,10 @@ use executor_utils::test_helpers::{
 use libra_config::{config::NodeConfig, utils::get_genesis_txn};
 use libra_crypto::{ed25519::*, test_utils::TEST_SEED, HashValue, PrivateKey, Uniform};
 use libra_types::{
-    account_config::{association_address, discovery_set_address, lbr_type_tag},
+    account_config::{
+        association_address, discovery_set_address, from_currency_code_string, lbr_type_tag,
+        LBR_NAME,
+    },
     account_state::AccountState,
     account_state_blob::AccountStateWithProof,
     discovery_set::DISCOVERY_SET_CHANGE_EVENT_PATH,
@@ -29,7 +33,7 @@ use std::convert::TryFrom;
 use stdlib::transaction_scripts::StdlibScript;
 use storage_interface::DbReaderWriter;
 use transaction_builder::{
-    encode_block_prologue_script, encode_create_account_script, encode_publishing_option_script,
+    encode_block_prologue_script, encode_mint_script, encode_publishing_option_script,
     encode_rotate_consensus_pubkey_script, encode_transfer_with_metadata_script,
 };
 
@@ -134,6 +138,7 @@ fn test_reconfiguration() {
             validator_auth_key_prefix,
             1_000_000,
             vec![],
+            vec![],
         )),
     );
     // Create a dummy block prologue transaction that will bump the timer.
@@ -229,6 +234,7 @@ fn test_change_publishing_option_to_custom() {
             &validator_account,
             validator_auth_key_prefix,
             1_000_000,
+            vec![],
             vec![],
         )),
     );
@@ -401,6 +407,7 @@ fn test_extend_whitelist() {
             &validator_account,
             validator_auth_key_prefix,
             1_000_000,
+            vec![],
             vec![],
         )),
     );
@@ -584,7 +591,7 @@ fn test_execution_with_storage() {
         /* sequence_number = */ 1,
         genesis_key.clone(),
         genesis_key.public_key(),
-        Some(encode_create_account_script(
+        Some(encode_mint_script(
             lbr_type_tag(),
             &account1,
             account1_auth_key.prefix().to_vec(),
@@ -598,7 +605,7 @@ fn test_execution_with_storage() {
         /* sequence_number = */ 2,
         genesis_key.clone(),
         genesis_key.public_key(),
-        Some(encode_create_account_script(
+        Some(encode_mint_script(
             lbr_type_tag(),
             &account2,
             account2_auth_key.prefix().to_vec(),
@@ -612,7 +619,7 @@ fn test_execution_with_storage() {
         /* sequence_number = */ 3,
         genesis_key.clone(),
         genesis_key.public_key(),
-        Some(encode_create_account_script(
+        Some(encode_mint_script(
             lbr_type_tag(),
             &account3,
             account3_auth_key.prefix().to_vec(),
@@ -633,6 +640,7 @@ fn test_execution_with_storage() {
             account2_auth_key.prefix().to_vec(),
             20_000,
             vec![],
+            vec![],
         )),
     );
 
@@ -649,6 +657,7 @@ fn test_execution_with_storage() {
             account3_auth_key.prefix().to_vec(),
             10_000,
             vec![],
+            vec![],
         )),
     );
 
@@ -664,6 +673,7 @@ fn test_execution_with_storage() {
             &account3,
             account3_auth_key.prefix().to_vec(),
             70_000,
+            vec![],
             vec![],
         )),
     );
@@ -686,6 +696,7 @@ fn test_execution_with_storage() {
                 &account3,
                 account3_auth_key.prefix().to_vec(),
                 10_000,
+                vec![],
                 vec![],
             )),
         ));
@@ -922,7 +933,8 @@ where
 {
     let balance = if let Some(blob) = &account_state_with_proof.blob {
         AccountState::try_from(blob)?
-            .get_balance_resource()?
+            .get_balance_resources(&[from_currency_code_string(LBR_NAME).unwrap()])?
+            .last()
             .map(|b| b.coin())
             .unwrap_or(0)
     } else {

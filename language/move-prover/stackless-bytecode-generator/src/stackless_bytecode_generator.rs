@@ -62,14 +62,21 @@ impl<'a> StacklessBytecodeGenerator<'a> {
             | MoveBytecode::BrFalse(code_offset)
             | MoveBytecode::Branch(code_offset) = bytecode
             {
-                let label = Label::new(label_map.len());
-                label_map.insert(*code_offset as CodeOffset, label);
+                let offs = *code_offset as CodeOffset;
+                if label_map.get(&offs).is_none() {
+                    let label = Label::new(label_map.len());
+                    label_map.insert(offs, label);
+                }
             }
             if let MoveBytecode::BrTrue(_) | MoveBytecode::BrFalse(_) = bytecode {
-                let fall_through_label = Label::new(label_map.len());
-                label_map.insert((pos + 1) as CodeOffset, fall_through_label);
+                let next_offs = (pos + 1) as CodeOffset;
+                if label_map.get(&next_offs).is_none() {
+                    let fall_through_label = Label::new(label_map.len());
+                    label_map.insert(next_offs, fall_through_label);
+                }
             };
         }
+
         // Generate bytecode.
         let mut given_spec_blocks = BTreeMap::new();
         for (code_offset, bytecode) in original_code.iter().enumerate() {
@@ -79,6 +86,17 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                 &label_map,
                 &mut given_spec_blocks,
             );
+        }
+
+        // Eliminate fall-through for non-branching instructions
+        let code = std::mem::replace(&mut self.code, vec![]);
+        for bytecode in code.into_iter() {
+            if let Bytecode::Label(attr_id, label) = bytecode {
+                if !self.code.is_empty() && !self.code[self.code.len() - 1].is_branch() {
+                    self.code.push(Bytecode::Jump(attr_id, label));
+                }
+            }
+            self.code.push(bytecode);
         }
 
         FunctionTargetData {
@@ -183,8 +201,7 @@ impl<'a> StacklessBytecodeGenerator<'a> {
 
             MoveBytecode::Abort => {
                 let error_code_index = self.temp_stack.pop().unwrap();
-                self.code
-                    .push(mk_call(Operation::Abort, vec![], vec![error_code_index]));
+                self.code.push(Bytecode::Abort(attr_id, error_code_index));
             }
 
             MoveBytecode::StLoc(idx) => {
