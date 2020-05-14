@@ -38,18 +38,16 @@
 use crate::{
     account_address::AccountAddress,
     account_config::{AccountResource, ACCOUNT_RECEIVED_EVENT_PATH, ACCOUNT_SENT_EVENT_PATH},
-    language_storage::{ModuleId, ResourceKey, StructTag},
+};
+use libra_crypto::hash::HashValue;
+use move_core_types::{
+    language_storage::{ModuleId, ResourceKey, StructTag, CODE_TAG, RESOURCE_TAG},
     move_resource::MoveResource,
 };
-use anyhow::{Error, Result};
-use libra_crypto::hash::{CryptoHash, HashValue};
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::{
-    convert::{TryFrom, TryInto},
-    fmt,
-};
+use std::fmt;
 
 #[derive(Clone, Eq, PartialEq, Default, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
@@ -59,8 +57,8 @@ pub struct AccessPath {
 }
 
 impl AccessPath {
-    const CODE_TAG: u8 = 0;
-    const RESOURCE_TAG: u8 = 1;
+    pub const CODE_TAG: u8 = 0;
+    pub const RESOURCE_TAG: u8 = 1;
 
     pub fn new(address: AccountAddress, path: Vec<u8>) -> Self {
         AccessPath { address, path }
@@ -91,11 +89,7 @@ impl AccessPath {
     }
 
     pub fn resource_access_vec(tag: &StructTag) -> Vec<u8> {
-        let mut key = vec![];
-        key.push(Self::RESOURCE_TAG);
-
-        key.append(&mut tag.hash().to_vec());
-        key
+        tag.access_vector()
     }
 
     /// Convert Accesses into a byte offset which would be used by the storage layer to resolve
@@ -109,10 +103,7 @@ impl AccessPath {
     }
 
     fn code_access_path_vec(key: &ModuleId) -> Vec<u8> {
-        let mut root = vec![];
-        root.push(Self::CODE_TAG);
-        root.append(&mut key.hash().to_vec());
-        root
+        key.access_vector()
     }
 
     pub fn code_access_path(key: &ModuleId) -> AccessPath {
@@ -142,8 +133,8 @@ impl fmt::Display for AccessPath {
         } else {
             write!(f, "AccessPath {{ address: {:x}, ", self.address)?;
             match self.path[0] {
-                Self::RESOURCE_TAG => write!(f, "type: Resource, ")?,
-                Self::CODE_TAG => write!(f, "type: Module, ")?,
+                RESOURCE_TAG => write!(f, "type: Resource, ")?,
+                CODE_TAG => write!(f, "type: Module, ")?,
                 tag => write!(f, "type: {:?}, ", tag)?,
             };
             write!(
@@ -160,19 +151,11 @@ impl fmt::Display for AccessPath {
     }
 }
 
-impl TryFrom<crate::proto::types::AccessPath> for AccessPath {
-    type Error = Error;
-
-    fn try_from(proto: crate::proto::types::AccessPath) -> Result<Self> {
-        Ok(AccessPath::new(proto.address.try_into()?, proto.path))
-    }
-}
-
-impl From<AccessPath> for crate::proto::types::AccessPath {
-    fn from(path: AccessPath) -> Self {
-        Self {
-            address: path.address.to_vec(),
-            path: path.path,
+impl From<&ModuleId> for AccessPath {
+    fn from(id: &ModuleId) -> AccessPath {
+        AccessPath {
+            address: *id.address(),
+            path: id.access_vector(),
         }
     }
 }

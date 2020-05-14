@@ -10,10 +10,12 @@ use libra_crypto::HashValue;
 use libra_logger::prelude::*;
 use libra_types::{
     access_path::AccessPath,
-    language_storage::{ModuleId, StructTag, TypeTag},
     vm_error::{StatusCode, VMStatus},
 };
-use move_core_types::identifier::{IdentStr, Identifier};
+use move_core_types::{
+    identifier::{IdentStr, Identifier},
+    language_storage::{ModuleId, StructTag, TypeTag},
+};
 use move_vm_types::{
     interpreter_context::InterpreterContext,
     loaded_data::{
@@ -215,6 +217,7 @@ impl ModuleCache {
             SignatureToken::U64 => Type::U64,
             SignatureToken::U128 => Type::U128,
             SignatureToken::Address => Type::Address,
+            SignatureToken::Signer => Type::Signer,
             SignatureToken::TypeParameter(idx) => Type::TyParam(*idx as usize),
             SignatureToken::Vector(inner_tok) => {
                 let inner_type = self.make_type(binary, inner_tok)?;
@@ -361,6 +364,7 @@ impl Loader {
             TypeTag::U64 => Type::U64,
             TypeTag::U128 => Type::U128,
             TypeTag::Address => Type::Address,
+            TypeTag::Signer => Type::Signer,
             TypeTag::Vector(tt) => Type::Vector(Box::new(self.load_type(tt, context)?)),
             TypeTag::Struct(struct_tag) => {
                 let module_id = ModuleId::new(struct_tag.address, struct_tag.module.clone());
@@ -1229,12 +1233,8 @@ pub struct FieldInstantiation {
 //
 
 fn load_script_dependencies(binary: &dyn ScriptAccess) -> Vec<ModuleId> {
-    let self_module = binary.self_handle();
     let mut deps = vec![];
     for module in binary.module_handles() {
-        if module == self_module {
-            continue;
-        }
         deps.push(ModuleId::new(
             *binary.address_identifier_at(module.address),
             binary.identifier_at(module.name).to_owned(),
@@ -1376,6 +1376,7 @@ impl Loader {
             U64 => FatType::U64,
             U128 => FatType::U128,
             Address => FatType::Address,
+            Signer => FatType::Signer,
             Vector(ty) => FatType::Vector(Box::new(self.type_to_fat_type(ty)?)),
             Struct(idx) => FatType::Struct(Box::new(self.struct_to_fat_struct(*idx, vec![])?)),
             StructInstantiation(idx, instantiation) => {

@@ -25,17 +25,15 @@ use std::collections::BTreeMap;
 
 fn build_test_config() -> (NodeConfig, Ed25519PrivateKey) {
     let mut validator_config = config_builder::ValidatorConfig::new();
-    let randomize_service_ports = true;
-    let randomize_libranet_ports = false;
     let (mut configs, key) = validator_config
         .build_waypoint(false)
-        .build_common(randomize_service_ports, randomize_libranet_ports)
+        .build_common(false)
         .unwrap();
     (configs.swap_remove(0), key)
 }
 
 fn create_storage(config: &NodeConfig) -> DbReaderWriter {
-    let db = DbReaderWriter::new(LibraDB::new(config.storage.dir()));
+    let db = DbReaderWriter::new(LibraDB::new_for_test(config.storage.dir()));
     bootstrap_db_if_empty::<MockVM>(&db, get_genesis_txn(&config).unwrap())
         .expect("Db-bootstrapper should not fail.");
     db

@@ -11,8 +11,6 @@ use libra_types::{
     account_address::AccountAddress,
     account_config,
     block_metadata::BlockMetadata,
-    language_storage::{ResourceKey, StructTag, TypeTag},
-    move_resource::MoveResource,
     on_chain_config::{LibraVersion, OnChainConfig, VMConfig},
     transaction::{
         ChangeSet, Module, Script, SignatureCheckedTransaction, SignedTransaction, Transaction,
@@ -25,6 +23,8 @@ use libra_types::{
 use move_core_types::{
     gas_schedule::{AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasUnits},
     identifier::{IdentStr, Identifier},
+    language_storage::{ResourceKey, StructTag, TypeTag},
+    move_resource::MoveResource,
 };
 use move_vm_runtime::MoveVM;
 use move_vm_state::{
@@ -34,14 +34,12 @@ use move_vm_state::{
 use move_vm_types::{
     chain_state::ChainState,
     gas_schedule::{calculate_intrinsic_gas, zero_cost_schedule},
+    transaction_metadata::TransactionMetadata,
     values::Value,
 };
 use rayon::prelude::*;
 use std::{collections::HashSet, convert::TryFrom, sync::Arc};
-use vm::{
-    errors::{convert_prologue_runtime_error, VMResult},
-    transaction_metadata::TransactionMetadata,
-};
+use vm::errors::{convert_prologue_runtime_error, VMResult};
 
 #[derive(Clone)]
 /// A wrapper to make VMRuntime standalone and thread safe.

@@ -4,6 +4,11 @@ module Libra {
     use 0x0::Transaction;
     use 0x0::Vector;
 
+    spec module {
+        // verify also private functions.
+        pragma verify = true;
+    }
+
     // A resource representing a fungible token
     resource struct T<Token> {
         // The value of the token. May be zero
@@ -19,7 +24,6 @@ module Libra {
     spec struct T {
         invariant pack sum_of_token_values<Token> = sum_of_token_values<Token> + value;
         invariant unpack sum_of_token_values<Token> = sum_of_token_values<Token> - value;
-        invariant update sum_of_token_values<Token> = sum_of_token_values<Token> - old(value) + value;
     }
 
     // A singleton resource that grants access to `Libra::mint`. Only the Association has one.
@@ -44,7 +48,7 @@ module Libra {
          invariant module token_is_registered<Token>() ==> mint_capability_count<Token> == 1;
     }
     spec module {
-        apply MintCapabilityCountInvariant<Token> to public *<Token>;
+       apply MintCapabilityCountInvariant<Token> to public *<Token>;
     }
 
     resource struct Info<Token> {

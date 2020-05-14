@@ -4,9 +4,9 @@
 use crate::{interpreter::Interpreter, loader::Resolver};
 use libra_types::{
     access_path::AccessPath, account_address::AccountAddress, account_config::CORE_CODE_ADDRESS,
-    contract_event::ContractEvent, language_storage::ModuleId,
+    contract_event::ContractEvent,
 };
-use move_core_types::{gas_schedule::CostTable, identifier::IdentStr};
+use move_core_types::{gas_schedule::CostTable, identifier::IdentStr, language_storage::ModuleId};
 use move_vm_natives::{account, event, hash, lcs, signature};
 use move_vm_types::{
     interpreter_context::InterpreterContext,
@@ -28,6 +28,7 @@ pub(crate) enum NativeFunction {
     HashSha2_256,
     HashSha3_256,
     LCSToBytes,
+    PubED25519Validate,
     SigED25519Verify,
     SigED25519ThresholdVerify,
     VectorLength,
@@ -57,6 +58,7 @@ impl NativeFunction {
             (&CORE_CODE_ADDRESS, "Hash", "sha2_256") => HashSha2_256,
             (&CORE_CODE_ADDRESS, "Hash", "sha3_256") => HashSha3_256,
             (&CORE_CODE_ADDRESS, "LCS", "to_bytes") => LCSToBytes,
+            (&CORE_CODE_ADDRESS, "Signature", "ed25519_validate_pubkey") => PubED25519Validate,
             (&CORE_CODE_ADDRESS, "Signature", "ed25519_verify") => SigED25519Verify,
             (&CORE_CODE_ADDRESS, "Signature", "ed25519_threshold_verify") => {
                 SigED25519ThresholdVerify
@@ -87,6 +89,7 @@ impl NativeFunction {
         match self {
             Self::HashSha2_256 => hash::native_sha2_256(ctx, t, v),
             Self::HashSha3_256 => hash::native_sha3_256(ctx, t, v),
+            Self::PubED25519Validate => signature::native_ed25519_publickey_validation(ctx, t, v),
             Self::SigED25519Verify => signature::native_ed25519_signature_verification(ctx, t, v),
             Self::SigED25519ThresholdVerify => {
                 signature::native_ed25519_threshold_signature_verification(ctx, t, v)

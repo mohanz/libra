@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, path::PathBuf};
+use std::path::PathBuf;
 
 // JSON RPC endpoint related defaults
-const DEFAULT_JSON_RPC_ADDR: &str = "127.0.0.1";
-const DEFAULT_JSON_RPC_PORT: u16 = 8080;
+const DEFAULT_JSON_RPC_ENDPOINT: &str = "https://127.0.0.1:8080";
 
 // Key manager timing related defaults
 const DEFAULT_ROTATION_PERIOD_SECS: u64 = 604_800; // 1 week
@@ -19,6 +18,12 @@ pub struct SecureConfig {
     pub key_manager: KeyManagerConfig,
 }
 
+impl SecureConfig {
+    pub fn set_data_dir(&mut self, data_dir: PathBuf) {
+        self.key_manager.set_data_dir(data_dir);
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KeyManagerConfig {
@@ -26,20 +31,26 @@ pub struct KeyManagerConfig {
     pub sleep_period_secs: u64,
     pub txn_expiration_secs: u64,
 
-    pub json_rpc_address: SocketAddr,
+    pub json_rpc_endpoint: String,
     pub secure_backend: SecureBackend,
 }
 
 impl Default for KeyManagerConfig {
     fn default() -> KeyManagerConfig {
         KeyManagerConfig {
-            json_rpc_address: format!("{}:{}", DEFAULT_JSON_RPC_ADDR, DEFAULT_JSON_RPC_PORT)
-                .parse()
-                .unwrap(),
-            secure_backend: SecureBackend::InMemoryStorage,
             rotation_period_secs: DEFAULT_ROTATION_PERIOD_SECS,
             sleep_period_secs: DEFAULT_SLEEP_PERIOD_SECS,
             txn_expiration_secs: DEFAULT_TXN_EXPIRATION_SECS,
+            json_rpc_endpoint: DEFAULT_JSON_RPC_ENDPOINT.into(),
+            secure_backend: SecureBackend::InMemoryStorage,
+        }
+    }
+}
+
+impl KeyManagerConfig {
+    pub fn set_data_dir(&mut self, data_dir: PathBuf) {
+        if let SecureBackend::OnDiskStorage(backend) = &mut self.secure_backend {
+            backend.set_data_dir(data_dir);
         }
     }
 }
@@ -48,9 +59,24 @@ impl Default for KeyManagerConfig {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum SecureBackend {
+    GitHub(GitHubConfig),
     InMemoryStorage,
     Vault(VaultConfig),
     OnDiskStorage(OnDiskStorageConfig),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct GitHubConfig {
+    /// The owner or account that hosts a repository
+    pub owner: String,
+    /// The repository where storage will mount
+    pub repository: String,
+    /// The authorization token for accessing the repository
+    pub token: String,
+    /// A namespace is an optional portion of the path to a key stored within OnDiskStorage. For
+    /// example, a key, S, without a namespace would be available in S, with a namespace, N, it
+    /// would be in N/S.
+    pub namespace: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -69,6 +95,10 @@ pub struct VaultConfig {
 pub struct OnDiskStorageConfig {
     // Required path for on disk storage
     pub path: PathBuf,
+    /// A namespace is an optional portion of the path to a key stored within OnDiskStorage. For
+    /// example, a key, S, without a namespace would be available in S, with a namespace, N, it
+    /// would be in N/S.
+    pub namespace: Option<String>,
     #[serde(skip)]
     data_dir: PathBuf,
 }
@@ -76,7 +106,8 @@ pub struct OnDiskStorageConfig {
 impl Default for OnDiskStorageConfig {
     fn default() -> Self {
         Self {
-            path: PathBuf::from("safety_rules.toml"),
+            namespace: None,
+            path: PathBuf::from("secure_storage.toml"),
             data_dir: PathBuf::from("/opt/libra/data/common"),
         }
     }

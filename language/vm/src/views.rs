@@ -16,8 +16,7 @@ use std::iter::DoubleEndedIterator;
 use crate::{access::ModuleAccess, file_format::*, SignatureTokenKind};
 use std::collections::BTreeSet;
 
-use libra_types::language_storage::ModuleId;
-use move_core_types::identifier::IdentStr;
+use move_core_types::{identifier::IdentStr, language_storage::ModuleId};
 use std::collections::BTreeMap;
 
 /// Represents a lazily evaluated abstraction over a module.
@@ -46,6 +45,10 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
             name_to_function_definition_view,
             name_to_struct_definition_view,
         }
+    }
+
+    pub fn self_handle_idx(&self) -> ModuleHandleIndex {
+        self.as_inner().self_handle_idx()
     }
 
     pub fn module_handles(
@@ -157,7 +160,7 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         &self,
         function_handle: &FunctionHandle,
     ) -> BTreeSet<StructDefinitionIndex> {
-        if function_handle.module.0 != CompiledModule::IMPLEMENTED_MODULE_INDEX {
+        if function_handle.module != self.module.self_handle_idx() {
             return BTreeSet::new();
         }
 

@@ -23,11 +23,10 @@ use getrandom::getrandom;
 use language_e2e_tests::executor::FakeExecutor;
 use libra_logger::{debug, error, info};
 use libra_state_view::StateView;
-use libra_types::{
-    account_address::AccountAddress, language_storage::TypeTag, vm_error::StatusCode,
-};
+use libra_types::{account_address::AccountAddress, vm_error::StatusCode};
 use libra_vm::LibraVM;
-use move_vm_types::values::Value;
+use move_core_types::language_storage::TypeTag;
+use move_vm_types::{transaction_metadata::TransactionMetadata, values::Value};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{fs, io::Write, panic, thread};
 use utils::module_generation::generate_module;
@@ -38,7 +37,6 @@ use vm::{
         CompiledModule, CompiledModuleMut, FunctionDefinitionIndex, Kind, SignatureToken,
         StructHandleIndex,
     },
-    transaction_metadata::TransactionMetadata,
 };
 
 /// This function calls the Bytecode verifier to test it
@@ -359,6 +357,7 @@ pub(crate) fn substitute(token: &SignatureToken, tys: &[SignatureToken]) -> Sign
         U64 => U64,
         U128 => U128,
         Address => Address,
+        Signer => Signer,
         Vector(ty) => Vector(Box::new(substitute(ty, tys))),
         Struct(idx) => Struct(*idx),
         StructInstantiation(idx, type_params) => StructInstantiation(
@@ -382,6 +381,7 @@ pub fn kind(module: &impl ModuleAccess, ty: &SignatureToken, constraints: &[Kind
     match ty {
         // The primitive types & references have kind unrestricted.
         Bool | U8 | U64 | U128 | Address | Reference(_) | MutableReference(_) => Kind::Copyable,
+        Signer => Kind::Resource,
         TypeParameter(idx) => constraints[*idx as usize],
         Vector(ty) => kind(module, ty, constraints),
         Struct(idx) => {

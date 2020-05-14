@@ -11,17 +11,17 @@ use libra_types::{
     account_address::AccountAddress,
     account_config,
     contract_event::ContractEvent,
-    language_storage::{ModuleId, TypeTag},
     transaction::{Script, TransactionArgument},
     write_set::WriteSet,
 };
 use move_core_types::{
     gas_schedule::{CostTable, GasAlgebra, GasCarrier, GasUnits},
     identifier::Identifier,
+    language_storage::{ModuleId, TypeTag},
 };
 use move_vm_runtime::MoveVM;
+use move_vm_types::transaction_metadata::TransactionMetadata;
 use std::collections::{btree_map::BTreeMap, HashMap};
-use vm::transaction_metadata::TransactionMetadata;
 
 use move_vm_state::{
     data_cache::{BlockDataCache, RemoteCache},

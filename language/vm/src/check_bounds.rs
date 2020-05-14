@@ -359,8 +359,7 @@ impl<'a> BoundsChecker<'a> {
                 FreezeRef | Pop | Ret | LdU8(_) | LdU64(_) | LdU128(_) | CastU8 | CastU64
                 | CastU128 | LdTrue | LdFalse | ReadRef | WriteRef | Add | Sub | Mul | Mod
                 | Div | BitOr | BitAnd | Xor | Shl | Shr | Or | And | Not | Eq | Neq | Lt | Gt
-                | Le | Ge | Abort | GetTxnGasUnitPrice | GetTxnMaxGasUnits | GetGasRemaining
-                | GetTxnSenderAddress | GetTxnSequenceNumber | GetTxnPublicKey | Nop => (),
+                | Le | Ge | Abort | GetTxnSenderAddress | Nop => (),
             }
         }
         Ok(())
@@ -371,7 +370,7 @@ impl<'a> BoundsChecker<'a> {
 
         for ty in ty.preorder_traversal() {
             match ty {
-                Bool | U8 | U64 | U128 | Address | TypeParameter(_) | Reference(_)
+                Bool | U8 | U64 | U128 | Address | Signer | TypeParameter(_) | Reference(_)
                 | MutableReference(_) | Vector(_) => (),
                 Struct(idx) => {
                     check_bounds_impl(&self.module.struct_handles, *idx)?;
@@ -428,6 +427,7 @@ impl<'a> BoundsChecker<'a> {
                 | U64
                 | U128
                 | Address
+                | Signer
                 | Struct(_)
                 | Reference(_)
                 | MutableReference(_)

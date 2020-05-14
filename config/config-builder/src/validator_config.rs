@@ -83,7 +83,7 @@ impl ValidatorConfig {
         self
     }
 
-    pub fn index(&mut self, index: usize) -> &mut Self {
+    pub fn validator_index(&mut self, index: usize) -> &mut Self {
         self.index = index;
         self
     }
@@ -93,12 +93,12 @@ impl ValidatorConfig {
         self
     }
 
-    pub fn nodes(&mut self, nodes: usize) -> &mut Self {
+    pub fn validators(&mut self, nodes: usize) -> &mut Self {
         self.nodes = nodes;
         self
     }
 
-    pub fn nodes_in_genesis(&mut self, nodes_in_genesis: Option<usize>) -> &mut Self {
+    pub fn validators_in_genesis(&mut self, nodes_in_genesis: Option<usize>) -> &mut Self {
         self.nodes_in_genesis = nodes_in_genesis;
         self
     }
@@ -165,12 +165,12 @@ impl ValidatorConfig {
     }
 
     pub fn build_set(&self) -> Result<Vec<NodeConfig>> {
-        let (configs, _) = self.build_common(false, false)?;
+        let (configs, _) = self.build_common(false)?;
         Ok(configs)
     }
 
     pub fn build_faucet_client(&self) -> Result<(Ed25519PrivateKey, Waypoint)> {
-        let (configs, faucet_key) = self.build_common(false, false)?;
+        let (configs, faucet_key) = self.build_common(false)?;
         Ok((
             faucet_key,
             configs[0]
@@ -182,8 +182,7 @@ impl ValidatorConfig {
 
     pub fn build_common(
         &self,
-        randomize_service_ports: bool,
-        randomize_libranet_ports: bool,
+        randomize_ports: bool,
     ) -> Result<(Vec<NodeConfig>, Ed25519PrivateKey)> {
         ensure!(self.nodes > 0, Error::NonZeroNetwork);
         ensure!(
@@ -195,13 +194,8 @@ impl ValidatorConfig {
         );
 
         let (faucet_key, config_seed) = self.build_faucet_key();
-        let generator::ValidatorSwarm { mut nodes, .. } = generator::validator_swarm(
-            &self.template,
-            self.nodes,
-            config_seed,
-            randomize_service_ports,
-            randomize_libranet_ports,
-        );
+        let generator::ValidatorSwarm { mut nodes, .. } =
+            generator::validator_swarm(&self.template, self.nodes, config_seed, randomize_ports);
 
         ensure!(
             nodes.len() == self.nodes,
@@ -225,7 +219,10 @@ impl ValidatorConfig {
 
         let waypoint = if self.build_waypoint {
             let path = TempPath::new();
-            let db_rw = DbReaderWriter::new(LibraDB::new(&path));
+            let db_rw = DbReaderWriter::new(LibraDB::open(
+                &path, false, /* readonly */
+                None,  /* pruner */
+            )?);
             Some(
                 db_bootstrapper::bootstrap_db_if_empty::<LibraVM>(&db_rw, &genesis)?
                     .ok_or_else(|| format_err!("Failed to bootstrap empty DB."))?,
@@ -287,7 +284,7 @@ impl ValidatorConfig {
 
 impl BuildSwarm for ValidatorConfig {
     fn build_swarm(&self) -> Result<(Vec<NodeConfig>, Ed25519PrivateKey)> {
-        self.build_common(true, true)
+        self.build_common(true)
     }
 }
 
@@ -304,7 +301,11 @@ mod test {
     #[test]
     fn verify_correctness() {
         let mut validator_config = ValidatorConfig::new();
-        let config = validator_config.nodes(2).index(1).build().unwrap();
+        let config = validator_config
+            .validators(2)
+            .validator_index(1)
+            .build()
+            .unwrap();
         let network = config.validator_network.as_ref().unwrap();
         let (seed_peer_id, seed_peer_ips) = network.seed_peers.seed_peers.iter().next().unwrap();
         assert!(&network.peer_id != seed_peer_id);
@@ -323,11 +324,15 @@ mod test {
 
     #[test]
     fn verify_same_genesis() {
-        let config1 = ValidatorConfig::new().nodes(10).index(1).build().unwrap();
+        let config1 = ValidatorConfig::new()
+            .validators(10)
+            .validator_index(1)
+            .build()
+            .unwrap();
         let config2 = ValidatorConfig::new()
-            .nodes(13)
-            .index(12)
-            .nodes_in_genesis(Some(10))
+            .validators(13)
+            .validator_index(12)
+            .validators_in_genesis(Some(10))
             .build()
             .unwrap();
 

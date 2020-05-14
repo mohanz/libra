@@ -8,11 +8,11 @@ use libra_types::account_config;
 use libra_types::{
     account_address::AccountAddress,
     block_metadata::BlockMetadata,
-    language_storage::TypeTag,
     on_chain_config::{LibraVersion, VMPublishingOption},
     transaction::{authenticator::AuthenticationKey, Script, Transaction, TransactionArgument},
 };
 use mirai_annotations::*;
+use move_core_types::language_storage::TypeTag;
 use std::convert::TryFrom;
 use stdlib::transaction_scripts::StdlibScript;
 #[cfg(any(test, feature = "fuzzing"))]
@@ -265,6 +265,15 @@ encode_txn_script! {
     script: RegisterApprovedPayment,
     doc: "Publish a newly created `ApprovedPayment` resource under the sender's account with approval key\
          `public_key`. Aborts if the sender already has a published `ApprovedPayment` resource."
+}
+
+encode_txn_script! {
+    name: encode_add_currency_to_account_script,
+    type_arg: currency,
+    args: [],
+    script: AddCurrencyToAccount,
+    doc: "Add the currency identified by the type `currency` to the sending accounts.\
+          Aborts if the account already holds a balance fo `currency` type."
 }
 
 encode_txn_script! {

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, Result};
-use libra_types::PeerId;
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -157,6 +156,7 @@ impl NodeConfig {
         self.base.data_dir = data_dir.clone();
         self.consensus.set_data_dir(data_dir.clone());
         self.metrics.set_data_dir(data_dir.clone());
+        self.secure.set_data_dir(data_dir.clone());
         self.storage.set_data_dir(data_dir);
     }
 
@@ -238,6 +238,11 @@ impl NodeConfig {
         self.debug_interface.randomize_ports();
         self.storage.randomize_ports();
         self.rpc.randomize_ports();
+
+        if let Some(network) = self.validator_network.as_mut() {
+            network.listen_address = crate::utils::get_available_port_in_multiaddr(true);
+            network.advertised_address = network.listen_address.clone();
+        }
     }
 
     pub fn random() -> Self {
@@ -263,8 +268,9 @@ impl NodeConfig {
         if self.base.role == RoleType::Validator {
             test.initialize_storage = true;
             test.random_account_key(rng);
-            let peer_id =
-                PeerId::from_public_key(&test.account_keypair.as_ref().unwrap().public_key());
+            let peer_id = libra_types::account_address::from_public_key(
+                &test.operator_keypair.as_ref().unwrap().public_key(),
+            );
 
             if self.validator_network.is_none() {
                 self.validator_network = Some(NetworkConfig::default());

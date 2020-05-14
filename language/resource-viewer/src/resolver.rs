@@ -4,12 +4,11 @@
 use crate::module_cache::ModuleCache;
 use anyhow::{anyhow, Result};
 use libra_state_view::StateView;
-use libra_types::{
-    access_path::AccessPath,
-    account_address::AccountAddress,
+use libra_types::{access_path::AccessPath, account_address::AccountAddress};
+use move_core_types::{
+    identifier::{IdentStr, Identifier},
     language_storage::{ModuleId, StructTag, TypeTag},
 };
-use move_core_types::identifier::{IdentStr, Identifier};
 use move_vm_types::loaded_data::types::{FatStructType, FatType};
 use std::rc::Rc;
 use stdlib::{stdlib_modules, StdLibOptions};
@@ -60,6 +59,7 @@ impl<'a> Resolver<'a> {
     pub fn resolve_type(&self, type_tag: &TypeTag) -> Result<FatType> {
         Ok(match type_tag {
             TypeTag::Address => FatType::Address,
+            TypeTag::Signer => FatType::Signer,
             TypeTag::Bool => FatType::Bool,
             TypeTag::Struct(st) => FatType::Struct(Box::new(self.resolve_struct(st)?)),
             TypeTag::U8 => FatType::U8,
@@ -100,6 +100,7 @@ impl<'a> Resolver<'a> {
             SignatureToken::U64 => FatType::U64,
             SignatureToken::U128 => FatType::U128,
             SignatureToken::Address => FatType::Address,
+            SignatureToken::Signer => FatType::Signer,
             SignatureToken::Vector(ty) => {
                 FatType::Vector(Box::new(self.resolve_signature(module, ty)?))
             }
@@ -161,20 +162,17 @@ impl<'a> Resolver<'a> {
             .collect();
         match &struct_def.field_information {
             StructFieldInformation::Native => Err(anyhow!("Unexpected Native Struct")),
-            StructFieldInformation::Declared(defs) => {
-                let mut fields = vec![];
-                for field_def in defs.iter() {
-                    fields.push(self.resolve_signature(module.clone(), &field_def.signature.0)?);
-                }
-                Ok(FatStructType {
-                    address,
-                    module: module_name,
-                    name,
-                    is_resource,
-                    ty_args,
-                    layout: fields,
-                })
-            }
+            StructFieldInformation::Declared(defs) => Ok(FatStructType {
+                address,
+                module: module_name,
+                name,
+                is_resource,
+                ty_args,
+                layout: defs
+                    .iter()
+                    .map(|field_def| self.resolve_signature(module.clone(), &field_def.signature.0))
+                    .collect::<Result<_>>()?,
+            }),
         }
     }
 }

@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use libra_types::vm_error::{StatusCode, VMStatus};
-use move_core_types::identifier::Identifier;
+use move_core_types::{identifier::Identifier, language_storage::ModuleId};
 use vm::errors::VMResult;
 
 use crate::loaded_data::types::FatType;
-use libra_types::language_storage::ModuleId;
 use vm::file_format::{Kind, StructDefinitionIndex};
 
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -26,6 +25,7 @@ pub enum Type {
     U64,
     U128,
     Address,
+    Signer,
     Vector(Box<Type>),
     Struct(usize),
     StructInstantiation(usize, Vec<Type>),
@@ -53,6 +53,7 @@ impl Type {
             Type::U64 => Type::U64,
             Type::U128 => Type::U128,
             Type::Address => Type::Address,
+            Type::Signer => Type::Signer,
             Type::Vector(ty) => Type::Vector(Box::new(ty.subst(ty_args)?)),
             Type::Reference(ty) => Type::Reference(Box::new(ty.subst(ty_args)?)),
             Type::MutableReference(ty) => Type::MutableReference(Box::new(ty.subst(ty_args)?)),

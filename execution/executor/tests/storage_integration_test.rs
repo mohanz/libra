@@ -11,13 +11,9 @@ use executor_utils::test_helpers::{
 use libra_config::{config::NodeConfig, utils::get_genesis_txn};
 use libra_crypto::{ed25519::*, test_utils::TEST_SEED, HashValue, PrivateKey, Uniform};
 use libra_types::{
-    account_config::{
-        association_address, discovery_set_address, from_currency_code_string, lbr_type_tag,
-        LBR_NAME,
-    },
+    account_config::{association_address, from_currency_code_string, lbr_type_tag, LBR_NAME},
     account_state::AccountState,
     account_state_blob::AccountStateWithProof,
-    discovery_set::DISCOVERY_SET_CHANGE_EVENT_PATH,
     event::EventKey,
     on_chain_config::VMPublishingOption,
     transaction::{
@@ -38,7 +34,7 @@ use transaction_builder::{
 };
 
 fn create_db_and_executor(config: &NodeConfig) -> (DbReaderWriter, Executor<LibraVM>) {
-    let db = DbReaderWriter::new(LibraDB::new(config.storage.dir()));
+    let db = DbReaderWriter::new(LibraDB::new_for_test(config.storage.dir()));
     bootstrap_db_if_empty::<LibraVM>(&db, get_genesis_txn(config).unwrap()).unwrap();
     let executor = Executor::<LibraVM>::new(db.clone());
 
@@ -60,25 +56,6 @@ fn test_genesis() {
     let li = li.ledger_info();
     assert_eq!(li.version(), 0);
 
-    let discovery_set_account = db
-        .reader
-        .get_account_state_with_proof(discovery_set_address(), 0, 0)
-        .unwrap();
-    discovery_set_account
-        .verify(li, 0, discovery_set_address())
-        .unwrap();
-    let (event_key, count) = discovery_set_account
-        .get_event_key_and_count_by_query_path(&DISCOVERY_SET_CHANGE_EVENT_PATH)
-        .unwrap();
-    assert_eq!(count, 1);
-    assert_eq!(
-        db.reader
-            .get_events(&event_key.unwrap(), 0, true, 100)
-            .unwrap()
-            .len(),
-        1
-    );
-
     let association_account = db
         .reader
         .get_account_state_with_proof(association_address(), 0, 0)
@@ -86,12 +63,6 @@ fn test_genesis() {
     association_account
         .verify(li, 0, association_address())
         .unwrap();
-    assert_eq!(
-        association_account
-            .get_event_key_and_count_by_query_path(&DISCOVERY_SET_CHANGE_EVENT_PATH)
-            .unwrap(),
-        (None, 0),
-    );
 }
 
 #[test]
@@ -114,7 +85,7 @@ fn test_reconfiguration() {
         .test
         .as_mut()
         .unwrap()
-        .account_keypair
+        .operator_keypair
         .as_mut()
         .unwrap();
     let validator_privkey = keys.take_private().unwrap();
@@ -207,7 +178,7 @@ fn test_change_publishing_option_to_custom() {
         .test
         .as_mut()
         .unwrap()
-        .account_keypair
+        .operator_keypair
         .as_mut()
         .unwrap();
     let validator_privkey = keys.take_private().unwrap();
@@ -383,7 +354,7 @@ fn test_extend_whitelist() {
         .test
         .as_mut()
         .unwrap()
-        .account_keypair
+        .operator_keypair
         .as_mut()
         .unwrap();
     let validator_privkey = keys.take_private().unwrap();

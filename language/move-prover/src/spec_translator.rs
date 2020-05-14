@@ -383,6 +383,11 @@ impl<'env> SpecTranslator<'env> {
     pub fn assume_preconditions(&self) {
         emitln!(self.writer, "assume $ExistsTxnSenderAccount($m, $txn);");
         let func_target = self.function_target();
+        // Assume abstract types for type parameters.
+        for (i, _) in func_target.get_type_parameters().iter().enumerate() {
+            emitln!(self.writer, "assume is#AbstractType($tv{});", i);
+        }
+        // Assume requires.
         let requires = func_target
             .get_spec()
             .filter(|c| match c.kind {
@@ -443,10 +448,10 @@ impl<'env> SpecTranslator<'env> {
     /// the struct is not mutated.
     fn translate_assume_well_formed(&self, struct_env: &StructEnv<'env>) {
         let emit_field_checks = |mode: WellFormedMode| {
-            emitln!(self.writer, "is#Vector($this)");
+            emitln!(self.writer, "$Vector_is_well_formed($this)");
             emitln!(
                 self.writer,
-                "  && $vlen($this) == {}",
+                "&& $vlen($this) == {}",
                 struct_env.get_fields().count()
             );
             for field in struct_env.get_fields() {

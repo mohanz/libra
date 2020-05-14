@@ -17,12 +17,14 @@ use libra_config::config::{NodeConfig, RoleType};
 use libra_network_address::NetworkAddress;
 use libra_types::{
     account_config,
-    discovery_set::{DiscoverySet, DiscoverySetResource},
+    account_state::AccountState,
+    on_chain_config::ValidatorSet,
     trusted_state::{TrustedState, TrustedStateChange},
     waypoint::Waypoint,
     PeerId,
 };
 use libra_vm::LibraVM;
+use libradb::LibraDB;
 use network::{
     connectivity_manager::ConnectivityRequest,
     peer_manager::{
@@ -36,8 +38,7 @@ use std::{
     collections::HashMap, convert::TryFrom, num::NonZeroUsize, str::FromStr, sync::Arc,
     time::Duration,
 };
-use storage_interface::DbReader;
-use storage_service::init_libra_db;
+use storage_interface::{DbReader, DbReaderWriter};
 use tokio::{
     runtime::{Handle, Runtime},
     task::JoinHandle,
@@ -148,19 +149,23 @@ impl MockOnchainDiscoveryNetworkSender {
     }
 }
 
-fn read_discovery_set(libra_db: &Arc<dyn DbReader>) -> DiscoverySet {
+fn read_validator_set(libra_db: &Arc<dyn DbReader>) -> ValidatorSet {
     let account_state_blob = libra_db
-        .get_latest_account_state(account_config::discovery_set_address())
+        .get_latest_account_state(account_config::validator_set_address())
         .unwrap()
         .unwrap();
-    let discovery_set_resource = DiscoverySetResource::try_from(&account_state_blob).unwrap();
-    DiscoverySet::from(discovery_set_resource)
+
+    AccountState::try_from(&account_state_blob)
+        .unwrap()
+        .get_validator_set()
+        .unwrap()
+        .unwrap()
 }
 
 fn gen_configs(count: usize) -> Vec<NodeConfig> {
     config_builder::ValidatorConfig::new()
-        .nodes(count)
-        .build_common(true, false)
+        .validators(count)
+        .build_common(false)
         .unwrap()
         .0
 }
@@ -168,12 +173,11 @@ fn gen_configs(count: usize) -> Vec<NodeConfig> {
 fn setup_storage_service_and_executor(
     config: &NodeConfig,
 ) -> (Arc<dyn DbReader>, Executor<LibraVM>, Waypoint) {
-    let (db_r, db_rw) = init_libra_db(config);
+    let (db_r, db_rw) = DbReaderWriter::wrap(LibraDB::new_for_test(&config.storage.dir()));
     let genesis_tx = config.execution.genesis.as_ref().unwrap();
     let waypoint = bootstrap_db_if_empty::<LibraVM>(&db_rw, genesis_tx)
         .expect("Db-bootstrapper should not fail.")
         .unwrap();
-
     let executor = Executor::new(db_rw);
 
     (db_r, executor, waypoint)
@@ -258,8 +262,8 @@ fn service_handles_remote_query() {
     let role = config.base.role;
 
     let (libra_db, _executor, waypoint) = setup_storage_service_and_executor(&config);
-    let discovery_set = read_discovery_set(&libra_db);
-    let expected_discovery_set = DiscoverySetInternal::from_discovery_set(role, discovery_set);
+    let validator_set = read_validator_set(&libra_db);
+    let expected_validator_set = DiscoverySetInternal::from_validator_set(role, validator_set);
 
     let (
         f_onchain_discovery,
@@ -282,7 +286,7 @@ fn service_handles_remote_query() {
         rt.block_on(mock_network_tx.query_discovery_set(other_peer_id, query_req.clone()));
 
     // verify response and ratchet epoch_info
-    let (trusted_state_change, opt_discovery_set) = query_res
+    let (trusted_state_change, opt_validator_set) = query_res
         .verify_and_ratchet(&query_req, &trusted_state)
         .unwrap();
 
@@ -292,10 +296,10 @@ fn service_handles_remote_query() {
         trusted_state_change
     );
 
-    // verify discovery set is the same as genesis discovery set
-    let actual_discovery_set =
-        DiscoverySetInternal::from_discovery_set(role, opt_discovery_set.unwrap());
-    assert_eq!(expected_discovery_set, actual_discovery_set);
+    // verify validator set is the same as genesis validator set
+    let actual_validator_set =
+        DiscoverySetInternal::from_validator_set(role, opt_validator_set.unwrap());
+    assert_eq!(expected_validator_set, actual_validator_set);
 
     // shutdown
     drop(mock_network_tx);
@@ -315,7 +319,7 @@ fn queries_storage_on_tick() {
     let role = config.base.role;
 
     let (libra_db, _executor, waypoint) = setup_storage_service_and_executor(&config);
-    let discovery_set = read_discovery_set(&libra_db);
+    let validator_set = read_validator_set(&libra_db);
 
     let (
         f_onchain_discovery,
@@ -337,11 +341,11 @@ fn queries_storage_on_tick() {
     drop(storage_query_ticker_tx);
 
     // expect updates for all other nodes except ourselves
-    let discovery_set = DiscoverySetInternal::from_discovery_set(role, discovery_set);
-    let expected_update_reqs = discovery_set
+    let validator_set = DiscoverySetInternal::from_validator_set(role, validator_set);
+    let expected_update_reqs = validator_set
         .0
         .into_iter()
-        .filter(|(peer_id, _discovery_info)| &self_peer_id != peer_id)
+        .filter(|(peer_id, _validator_info)| &self_peer_id != peer_id)
         .map(|(peer_id, DiscoveryInfoInternal(_id_pubkey, addrs))| (peer_id, addrs))
         .collect::<HashMap<_, _>>();
 
@@ -403,7 +407,7 @@ fn queries_peers_on_tick() {
     let client_role = client_config.base.role;
 
     let (libra_db, _executor, waypoint) = setup_storage_service_and_executor(&client_config);
-    let discovery_set = read_discovery_set(&libra_db);
+    let validator_set = read_validator_set(&libra_db);
 
     let (
         f_client_onchain_discovery,
@@ -440,8 +444,8 @@ fn queries_peers_on_tick() {
     drop(client_storage_query_ticker_tx);
 
     // expect updates for all other nodes except ourselves
-    let discovery_set = DiscoverySetInternal::from_discovery_set(client_role, discovery_set);
-    let expected_update_reqs = discovery_set
+    let validator_set = DiscoverySetInternal::from_validator_set(client_role, validator_set);
+    let expected_update_reqs = validator_set
         .0
         .into_iter()
         .filter(|(peer_id, _discovery_info)| &client_peer_id != peer_id)

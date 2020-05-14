@@ -14,15 +14,17 @@ use libra_types::{
         BalanceResource, ReceivedPaymentEvent, SentPaymentEvent, LBR_NAME,
     },
     event::EventHandle,
-    language_storage::{ResourceKey, StructTag, TypeTag},
-    move_resource::MoveResource,
     transaction::{
         authenticator::AuthenticationKey, RawTransaction, Script, SignedTransaction,
         TransactionArgument, TransactionPayload,
     },
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
-use move_core_types::identifier::{IdentStr, Identifier};
+use move_core_types::{
+    identifier::{IdentStr, Identifier},
+    language_storage::{ResourceKey, StructTag, TypeTag},
+    move_resource::MoveResource,
+};
 use move_vm_types::{
     loaded_data::types::{FatStructType, FatType},
     values::{Struct, Value},
@@ -68,7 +70,7 @@ impl Account {
     /// Like with [`Account::new`], the account returned by this constructor is a purely logical
     /// entity.
     pub fn with_keypair(privkey: Ed25519PrivateKey, pubkey: Ed25519PublicKey) -> Self {
-        let addr = AccountAddress::from_public_key(&pubkey);
+        let addr = libra_types::account_address::from_public_key(&pubkey);
         Account {
             addr,
             privkey,
@@ -822,7 +824,7 @@ impl AccountData {
         let balance_currency_code = self.balance_currency_code.as_bytes();
         let account = Value::struct_(Struct::pack(vec![
             // TODO: this needs to compute the auth key instead
-            Value::vector_u8(AccountAddress::authentication_key(&self.account.pubkey).to_vec()),
+            Value::vector_u8(AuthenticationKey::ed25519(&self.account.pubkey).to_vec()),
             Value::bool(self.delegated_key_rotation_capability),
             Value::bool(self.delegated_withdrawal_capability),
             Value::struct_(Struct::pack(vec![

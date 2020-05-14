@@ -4,6 +4,11 @@ address 0x0 {
 module TestMarketCapWithSchemas {
 
     spec module {
+        pragma verify = true;
+    }
+
+
+    spec module {
         global sum_of_coins<X>: num;
     }
 
@@ -23,7 +28,6 @@ module TestMarketCapWithSchemas {
         value: num;
         invariant pack sum_of_coins<X> = sum_of_coins<X> + value;
         invariant unpack sum_of_coins<X> = sum_of_coins<X> - value;
-        invariant update sum_of_coins<X> = sum_of_coins<X> - old(value) + value;
     }
 
 

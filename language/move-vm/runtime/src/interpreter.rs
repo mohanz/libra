@@ -5,6 +5,7 @@ use crate::{
     gas,
     loader::{Function, Loader, Resolver},
     native_functions::FunctionContext,
+    trace,
 };
 use libra_logger::prelude::*;
 use libra_types::{
@@ -18,6 +19,7 @@ use move_vm_types::{
     gas_schedule::calculate_intrinsic_gas,
     interpreter_context::InterpreterContext,
     loaded_data::{runtime_types::Type, types::FatStructType},
+    transaction_metadata::TransactionMetadata,
     values::{self, IntegerValue, Locals, Reference, Struct, StructRef, VMValueCast, Value},
 };
 use std::{cmp::min, collections::VecDeque, fmt::Write, sync::Arc};
@@ -28,7 +30,6 @@ use vm::{
         StructDefinitionIndex,
     },
     file_format_common::Opcodes,
-    transaction_metadata::TransactionMetadata,
 };
 
 macro_rules! debug_write {
@@ -679,6 +680,7 @@ impl Frame {
         let code = self.function.code();
         loop {
             for instruction in &code[self.pc as usize..] {
+                trace!(self.function.pretty_string(), self.pc, instruction);
                 self.pc += 1;
 
                 match instruction {
@@ -1146,16 +1148,6 @@ impl Frame {
                         gas!(const_instr: context, interpreter, Opcodes::NOT)?;
                         let value = !interpreter.operand_stack.pop_as::<bool>()?;
                         interpreter.operand_stack.push(Value::bool(value))?;
-                    }
-                    Bytecode::GetGasRemaining
-                    | Bytecode::GetTxnPublicKey
-                    | Bytecode::GetTxnSequenceNumber
-                    | Bytecode::GetTxnMaxGasUnits
-                    | Bytecode::GetTxnGasUnitPrice => {
-                        return Err(VMStatus::new(StatusCode::VERIFIER_INVARIANT_VIOLATION)
-                            .with_message(
-                                "This opcode is deprecated and will be removed soon".to_string(),
-                            ));
                     }
                     Bytecode::Nop => {
                         gas!(const_instr: context, interpreter, Opcodes::NOP)?;

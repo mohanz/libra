@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{on_chain_config::OnChainConfig, validator_info::ValidatorInfo};
-use anyhow::{Error, Result};
+use anyhow::Result;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::{convert::TryFrom, fmt};
+use std::{fmt, iter::IntoIterator, vec};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
@@ -58,23 +58,16 @@ impl ValidatorSet {
     }
 }
 
-impl TryFrom<crate::proto::types::ValidatorSet> for ValidatorSet {
-    type Error = Error;
-
-    fn try_from(proto: crate::proto::types::ValidatorSet) -> Result<Self> {
-        Ok(lcs::from_bytes(&proto.bytes)?)
-    }
-}
-
-impl From<ValidatorSet> for crate::proto::types::ValidatorSet {
-    fn from(set: ValidatorSet) -> Self {
-        Self {
-            bytes: lcs::to_bytes(&set).expect("failed to serialize validator set"),
-        }
-    }
-}
-
 impl OnChainConfig for ValidatorSet {
     // validator_set_address
     const IDENTIFIER: &'static str = "LibraSystem";
+}
+
+impl IntoIterator for ValidatorSet {
+    type Item = ValidatorInfo;
+    type IntoIter = vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.payload.into_iter()
+    }
 }

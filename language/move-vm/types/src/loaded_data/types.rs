@@ -4,10 +4,12 @@
 
 use libra_types::{
     account_address::AccountAddress,
-    language_storage::{StructTag, TypeTag},
     vm_error::{StatusCode, VMStatus},
 };
-use move_core_types::identifier::Identifier;
+use move_core_types::{
+    identifier::Identifier,
+    language_storage::{StructTag, TypeTag},
+};
 use std::fmt::Write;
 use vm::errors::VMResult;
 
@@ -41,6 +43,7 @@ pub enum FatType {
     U64,
     U128,
     Address,
+    Signer,
     Vector(Box<FatType>),
     Struct(Box<FatStructType>),
     Reference(Box<FatType>),
@@ -124,6 +127,7 @@ impl FatType {
             U64 => U64,
             U128 => U128,
             Address => Address,
+            Signer => Signer,
             Vector(ty) => Vector(Box::new(ty.subst(ty_args)?)),
             Reference(ty) => Reference(Box::new(ty.subst(ty_args)?)),
             MutableReference(ty) => MutableReference(Box::new(ty.subst(ty_args)?)),
@@ -143,6 +147,7 @@ impl FatType {
             U64 => TypeTag::U64,
             U128 => TypeTag::U128,
             Address => TypeTag::Address,
+            Signer => TypeTag::Signer,
             Vector(ty) => TypeTag::Vector(Box::new(ty.type_tag()?)),
             Struct(struct_ty) => TypeTag::Struct(struct_ty.struct_tag()?),
 
@@ -160,6 +165,7 @@ impl FatType {
 
         match self {
             Bool | U8 | U64 | U128 | Address | Reference(_) | MutableReference(_) => Ok(false),
+            Signer => Ok(true),
             Vector(ty) => ty.is_resource(),
             Struct(struct_ty) => Ok(struct_ty.is_resource),
             // In the VM, concrete type arguments are required for type resolution and the only place
@@ -181,6 +187,7 @@ impl FatType {
             U64 => debug_write!(buf, "u64"),
             U128 => debug_write!(buf, "u128"),
             Address => debug_write!(buf, "address"),
+            Signer => debug_write!(buf, "signer"),
             Vector(elem_ty) => {
                 debug_write!(buf, "vector<")?;
                 elem_ty.debug_print(buf)?;
@@ -211,7 +218,14 @@ pub mod prop {
         pub fn single_value_strategy() -> impl Strategy<Value = Self> {
             use FatType::*;
 
-            prop_oneof![Just(Bool), Just(U8), Just(U64), Just(U128), Just(Address),]
+            prop_oneof![
+                Just(Bool),
+                Just(U8),
+                Just(U64),
+                Just(U128),
+                Just(Address),
+                Just(Signer)
+            ]
         }
 
         /// Generate a primitive Value, a Struct or a Vector.

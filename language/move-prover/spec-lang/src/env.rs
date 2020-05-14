@@ -18,7 +18,7 @@ use itertools::Itertools;
 use num::{BigUint, Num};
 
 use bytecode_source_map::source_map::SourceMap;
-use libra_types::{account_address::AccountAddress, language_storage};
+use move_core_types::{account_address::AccountAddress, language_storage};
 use move_vm_types::values::Value as VMValue;
 use vm::{
     access::ModuleAccess,
@@ -882,6 +882,7 @@ impl<'env> ModuleEnv<'env> {
             SignatureToken::U64 => Type::Primitive(PrimitiveType::U64),
             SignatureToken::U128 => Type::Primitive(PrimitiveType::U128),
             SignatureToken::Address => Type::Primitive(PrimitiveType::Address),
+            SignatureToken::Signer => Type::Primitive(PrimitiveType::Signer),
             SignatureToken::Reference(t) => {
                 Type::Reference(false, Box::new(self.globalize_signature(&*t)))
             }
@@ -1126,6 +1127,11 @@ impl<'env> StructEnv<'env> {
                 struct_env: self.clone(),
                 data,
             })
+    }
+
+    /// Return the number of fields in the struct.
+    pub fn get_field_count(&self) -> usize {
+        self.data.field_data.len()
     }
 
     /// Gets a field by its id.
@@ -1490,6 +1496,20 @@ impl<'env> FunctionEnv<'env> {
     /// Returns associated specification.
     pub fn get_spec(&'env self) -> &'env Spec {
         &self.data.spec
+    }
+
+    /// Returns the acquired global resource types.
+    pub fn get_acquires_global_resources(&'env self) -> Vec<StructId> {
+        let function_definition = self
+            .module_env
+            .data
+            .module
+            .function_def_at(self.get_def_idx());
+        function_definition
+            .acquires_global_resources
+            .iter()
+            .map(|x| self.module_env.get_struct_id(*x))
+            .collect()
     }
 
     fn definition_view(&'env self) -> FunctionDefinitionView<'env, CompiledModule> {
