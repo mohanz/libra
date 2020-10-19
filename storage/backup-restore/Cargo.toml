@@ -17,7 +17,7 @@ hex = "0.4.2"
 itertools = "0.9"
 rand = "0.7.3"
 structopt = "0.3"
-tokio = "0.2"
+tokio = "0.3"
 
 lcs = { path = "../../common/lcs", package = "libra-canonical-serialization", version = "0.1.0" }
 libradb = { path = "../libradb", version = "0.1.0" }
