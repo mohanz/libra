@@ -1,0 +1,41 @@
+version: 2
+updates:
+- package-ecosystem: cargo
+  directory: "/"
+  schedule:
+    interval: daily
+  open-pull-requests-limit: 10
+  target-branch: master
+  allow:
+  - dependency-type: direct
+  ignore:
+  - dependency-name: codespan*
+    versions:
+    - ">= 0"
+  - dependency-name: anyhow
+    versions:
+    - 1.0.38
+    - 1.0.39
+  - dependency-name: once_cell
+    versions:
+    - 1.5.2
+    - 1.6.0
+    - 1.7.0
+  - dependency-name: backtrace
+    versions:
+    - 0.3.56
+  - dependency-name: thiserror
+    versions:
+    - 1.0.23
+  - dependency-name: quote
+    versions:
+    - 1.0.8
+  - dependency-name: simplelog
+    versions:
+    - 0.9.0
+  - dependency-name: cc
+    versions:
+    - 1.0.66
+  - dependency-name: proc-macro2
+    versions:
+    - 1.0.24
